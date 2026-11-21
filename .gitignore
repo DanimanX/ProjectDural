@@ -2,6 +2,12 @@
 roms/
 refs/
 build/
+build-arm64/
+build-host-arm64/
+deps/
+extern/
+dist/
+saves/
 *.zip
 *.bin
 .DS_Store

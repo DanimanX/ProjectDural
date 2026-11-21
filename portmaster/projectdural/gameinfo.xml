@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<gameList>
+  <game>
+    <path>./Virtua Fighter 2.sh</path>
+    <name>ProjectDural (Virtua Fighter 2)</name>
+    <desc>Native ARM64 / OpenGL ES 2.0 static recompilation runtime for Sega Model 2A Virtua Fighter 2 (Version 2.1), tuned for Allwinner H700 / Anbernic RG34XX with on-device SLJIT ARM64 compilation, 3:2 widescreen, and Core 2 SCSP sound. Bring your own MAME vf2.zip.</desc>
+    <releasedate>19941101T000000</releasedate>
+    <developer>SEGA AM2 (Recomp: mr-finster, ARM64 Port: ProjectDural)</developer>
+    <publisher>PortMaster</publisher>
+    <genre>Fighting</genre>
+    <players>1-2</players>
+  </game>
+</gameList>

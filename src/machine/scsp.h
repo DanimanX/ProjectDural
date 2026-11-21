@@ -75,6 +75,8 @@ public:
 	void set_group_gain(int group, float gain);
 	void set_next_group(int slot, int group) { m_next_group[slot & 31] = u8(group); }
 	int slot_group(int slot) const { return m_slot_group[slot & 31]; }
+	void set_dsp_enabled(bool on) { m_dsp_enabled = on; }
+	bool dsp_enabled() const { return m_dsp_enabled; }
 	const SCSPDSP &dsp() const { return m_DSP; }
 
 private:
@@ -126,6 +128,7 @@ private:
 
 	float m_group_gain[GROUPS] = { 1, 1 };
 	bool m_group_gains = false;   // any gain not 1
+	bool m_dsp_enabled = true;    // optional host toggle for low-power handhelds
 	// The effects' leveller, on while the groups have their own volumes (with the music turned
 	// down, nothing masks the effects' own range, 16 dB from a jab to a KO's last hit): above
 	// FX_THRESHOLD (their power, as the board mixes them, before their volume) it takes the

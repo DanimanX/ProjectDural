@@ -1250,7 +1250,7 @@ void scsp_device::DoMasterSamples(int samples)
 				// near-silence.)
 				u16 eff_tl = SDIR(slot) ? 0 : TL(slot);
 				Enc = ((eff_tl) << 0x0) | ((IMXL(slot)) << 0xd);
-				m_DSP.SetSample((sample*m_LPANTABLE[Enc]) >> (SHIFT-2), ISEL(slot), IMXL(slot));
+				if (m_dsp_enabled) m_DSP.SetSample((sample*m_LPANTABLE[Enc]) >> (SHIFT-2), ISEL(slot), IMXL(slot));
 				u16 dir_tl = SDIR(slot) ? 0 : TL(slot);
 				if (m_probe) {
 					const double in = double((sample*m_LPANTABLE[((eff_tl) << 0x0) | ((IMXL(slot)) << 0xd)]) >> (SHIFT-2));
@@ -1280,7 +1280,7 @@ void scsp_device::DoMasterSamples(int samples)
 #endif
 		}
 
-		m_DSP.Step();
+		if (m_dsp_enabled) m_DSP.Step();
 
 		if (m_group_gains) {   // the effects' leveller: its gain for the next sample
 			const float l = float(fxl >> 2) / 32768, r = float(fxr >> 2) / 32768;
@@ -1293,7 +1293,7 @@ void scsp_device::DoMasterSamples(int samples)
 			m_fx_level = m_fx_env > FX_THRESHOLD ? std::pow(m_fx_env / FX_THRESHOLD, -0.5f * (1 - 1 / FX_RATIO)) : 1.0f;
 		}
 
-		for (int i = 0; i < 16; ++i)
+		if (m_dsp_enabled) for (int i = 0; i < 16; ++i)
 		{
 			SCSP_SLOT *slot = m_Slots + i;
 			if (EFSDL(slot))

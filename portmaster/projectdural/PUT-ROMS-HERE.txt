@@ -1,0 +1,21 @@
+ProjectDural — Bring Your Own Data (BYOD)
+==========================================
+
+No copyrighted ROM files or ROM-derived compiled code are included in this package.
+
+Required file on your handheld SD card:
+1. Copy your legally dumped MAME ZIP ROM archive into this folder (roms/):
+     - roms/vf2.zip     (Virtua Fighter 2 Version 2.1, MAME `vf2` set)
+
+Note: Unlike DaytonaArm, ProjectDural recompiles the i960 arcade program
+directly into native ARM64 machine code in memory at startup using SLJIT.
+No PC pre-compilation step is required!
+
+Controls on Anbernic RG34XX:
+  - D-Pad          : Move
+  - X / A / B      : Guard / Punch / Kick
+  - Y / R1 / L1    : G+P / P+K / G+K macros
+  - R2             : P+K+G (All Three)
+  - Start / Select : Start / Coin
+  - Start + Select : Pause & Settings Menu (or Menu button)
+  - Select + Y / X : Cabinet Test / Service
