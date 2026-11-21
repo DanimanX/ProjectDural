@@ -703,6 +703,108 @@ void GpuGlesRenderer::update_texture_rgba(uint32_t &tex, int &cur_w, int &cur_h,
     }
 }
 
+void GpuGlesRenderer::update_texture_2d_rgb565(uint32_t &tex, int &cur_w, int &cur_h, int w, int h, bool linear,
+                                               const uint32_t *argb, size_t stride_px, std::vector<uint16_t> &shadow) {
+    if (w <= 0 || h <= 0 || !argb) return;
+    const size_t total = size_t(w) * size_t(h);
+    const bool realloc_tex = (!tex || cur_w != w || cur_h != h || shadow.size() != total);
+    if (realloc_tex) shadow.resize(total);
+    int y_min = h, y_max = -1;
+    for (int y = 0; y < h; ++y) {
+        const uint32_t *src = argb + size_t(y) * stride_px;
+        uint16_t *dst = shadow.data() + size_t(y) * size_t(w);
+        bool row_dirty = realloc_tex;
+        for (int x = 0; x < w; ++x) {
+            const uint32_t c = src[x];
+            const uint16_t p = uint16_t(((c >> 8) & 0xf800u) | ((c >> 5) & 0x07e0u) | ((c >> 3) & 0x001fu));
+            if (dst[x] != p) {
+                dst[x] = p;
+                row_dirty = true;
+            }
+        }
+        if (row_dirty) {
+            if (y < y_min) y_min = y;
+            y_max = y + 1;
+        }
+    }
+    auto &gl = g.gl;
+    if (realloc_tex) {
+        if (tex && g.ready) { GLuint t = tex; gl.glDeleteTextures(1, &t); }
+        GLuint t = 0;
+        gl.glGenTextures(1, &t);
+        tex = t;
+        if (!tex) return;
+        gl.glActiveTexture(GL_TEXTURE0);
+        gl.glBindTexture(GL_TEXTURE_2D, tex);
+        gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, linear ? GL_LINEAR : GL_NEAREST);
+        gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, linear ? GL_LINEAR : GL_NEAREST);
+        gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        gl.glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, w, h, 0, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, shadow.data());
+        cur_w = w;
+        cur_h = h;
+    } else if (y_max > y_min) {
+        gl.glActiveTexture(GL_TEXTURE0);
+        gl.glBindTexture(GL_TEXTURE_2D, tex);
+        gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, linear ? GL_LINEAR : GL_NEAREST);
+        gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, linear ? GL_LINEAR : GL_NEAREST);
+        gl.glTexSubImage2D(GL_TEXTURE_2D, 0, 0, y_min, w, y_max - y_min, GL_RGB, GL_UNSIGNED_SHORT_5_6_5,
+                           shadow.data() + size_t(y_min) * size_t(w));
+    }
+}
+
+void GpuGlesRenderer::update_texture_2d_rgba5551(uint32_t &tex, int &cur_w, int &cur_h, int w, int h, bool linear,
+                                                 const uint32_t *argb, size_t stride_px, std::vector<uint16_t> &shadow) {
+    if (w <= 0 || h <= 0 || !argb) return;
+    const size_t total = size_t(w) * size_t(h);
+    const bool realloc_tex = (!tex || cur_w != w || cur_h != h || shadow.size() != total);
+    if (realloc_tex) shadow.resize(total);
+    int y_min = h, y_max = -1;
+    for (int y = 0; y < h; ++y) {
+        const uint32_t *src = argb + size_t(y) * stride_px;
+        uint16_t *dst = shadow.data() + size_t(y) * size_t(w);
+        bool row_dirty = realloc_tex;
+        for (int x = 0; x < w; ++x) {
+            const uint32_t c = src[x];
+            const uint16_t p = (c >> 24)
+                ? uint16_t((((c >> 19) & 0x1fu) << 11) | (((c >> 11) & 0x1fu) << 6) | (((c >> 3) & 0x1fu) << 1) | 1u)
+                : 0u;
+            if (dst[x] != p) {
+                dst[x] = p;
+                row_dirty = true;
+            }
+        }
+        if (row_dirty) {
+            if (y < y_min) y_min = y;
+            y_max = y + 1;
+        }
+    }
+    auto &gl = g.gl;
+    if (realloc_tex) {
+        if (tex && g.ready) { GLuint t = tex; gl.glDeleteTextures(1, &t); }
+        GLuint t = 0;
+        gl.glGenTextures(1, &t);
+        tex = t;
+        if (!tex) return;
+        gl.glActiveTexture(GL_TEXTURE0);
+        gl.glBindTexture(GL_TEXTURE_2D, tex);
+        gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, linear ? GL_LINEAR : GL_NEAREST);
+        gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, linear ? GL_LINEAR : GL_NEAREST);
+        gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        gl.glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_SHORT_5_5_5_1, shadow.data());
+        cur_w = w;
+        cur_h = h;
+    } else if (y_max > y_min) {
+        gl.glActiveTexture(GL_TEXTURE0);
+        gl.glBindTexture(GL_TEXTURE_2D, tex);
+        gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, linear ? GL_LINEAR : GL_NEAREST);
+        gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, linear ? GL_LINEAR : GL_NEAREST);
+        gl.glTexSubImage2D(GL_TEXTURE_2D, 0, 0, y_min, w, y_max - y_min, GL_RGBA, GL_UNSIGNED_SHORT_5_5_5_1,
+                           shadow.data() + size_t(y_min) * size_t(w));
+    }
+}
+
 void GpuGlesRenderer::clear_tex_cache() {
     auto &gl = g.gl;
     for (auto &entry : sources_) {
@@ -711,6 +813,7 @@ void GpuGlesRenderer::clear_tex_cache() {
     }
     sources_.clear();
     cached_bytes_ = 0;
+    last_tex_clears_++;
 }
 
 void GpuGlesRenderer::clear_pal_cache() {
@@ -718,6 +821,7 @@ void GpuGlesRenderer::clear_pal_cache() {
     palette_used_ = 0;
     palette_dirty_begin_ = UINT32_MAX;
     palette_dirty_end_ = 0;
+    last_pal_clears_++;
 }
 
 void GpuGlesRenderer::reset_caches() {
@@ -823,7 +927,7 @@ const GpuGlesRenderer::TexSource *GpuGlesRenderer::source_for(const gpu3d_poly &
 int GpuGlesRenderer::palette_row(const gpu3d_poly &poly, const gpu3d_rams &rams) {
     const uint32_t lumabase = poly.lumabase & 0x7fffu;
     const uint32_t pal = poly.pal & 0x7fffu;
-    const uint32_t luma_scale = poly.luma;
+    const uint32_t luma_scale = poly.luma & 0xfffcu;
     const uint64_t key = uint64_t(lumabase) | (uint64_t(pal) << 16) | (uint64_t(luma_scale) << 32);
     auto it = palette_index_.find(key);
     if (it != palette_index_.end()) return int(it->second);
@@ -988,20 +1092,20 @@ void GpuGlesRenderer::draw_frame(const model2a::picture_parts &parts, int w2d, A
     float sx = 1.0f, sy = 1.0f, ox = 0.0f, oy = 0.0f;
     compute_viewport(w, aspect, sx, sy, ox, oy);
 
-    const int pad = model2a::picture_parts::PAD;
+    const int pad = parts.bd_unpadded ? 0 : model2a::picture_parts::PAD;
     if (parts.version != last_2d_version_) {
         last_2d_version_ = parts.version;
         if (parts.backdrop) {
-            update_texture_rgba(tex_bd_, bd_w_, bd_h_, w + 2 * pad, 384 + 2 * pad, parts.filter,
-                                parts.backdrop, size_t(w + 2 * pad));
+            update_texture_2d_rgb565(tex_bd_, bd_w_, bd_h_, w + 2 * pad, 384 + 2 * pad, parts.filter,
+                                     parts.backdrop, size_t(w + 2 * pad), bd_shadow_);
         }
         mid_empty_ = !parts.mid || buffer_all_zero(parts.mid, w, 384);
         if (!mid_empty_) {
-            update_texture_rgba(tex_mid_, mid_w_, mid_h_, w, 384, false, parts.mid, size_t(w));
+            update_texture_2d_rgba5551(tex_mid_, mid_w_, mid_h_, w, 384, false, parts.mid, size_t(w), mid_shadow_);
         }
         top_empty_ = !parts.top || buffer_all_zero(parts.top, w, 384);
         if (!top_empty_) {
-            update_texture_rgba(tex_top_, top_w_, top_h_, w, 384, false, parts.top, size_t(w));
+            update_texture_2d_rgba5551(tex_top_, top_w_, top_h_, w, 384, false, parts.top, size_t(w), top_shadow_);
         }
     }
 

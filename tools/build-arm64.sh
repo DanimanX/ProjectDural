@@ -181,7 +181,9 @@ printf '%s\n' "${RT_SRCS[@]}" | xargs -P "$JOBS" -I{} sh -c '
     out="$2/${tag}.o"
     extra=""
     case "$src" in
+        third_party/mame/m68000/*) extra="-w -O3 -fno-math-errno" ;;
         third_party/*|src/host/stb_image_impl.cpp) extra="-w" ;;
+        src/machine/scsp.cpp|src/machine/scspdsp.cpp|src/machine/model2_video.cpp|src/machine/model2_smooth.cpp) extra="-O3 -fno-math-errno" ;;
     esac
     exec "$3" c++ '"$CXX_FLAGS"' $extra -c "$src" -o "$out"
 ' _ {} "$BDIR/rt" "$ZIG_BIN"
@@ -208,7 +210,7 @@ APP_SRCS=(platform/arm64/gpu_gles.cpp platform/arm64/main_arm64.cpp)
 printf '%s\n' "${APP_SRCS[@]}" | xargs -P "$JOBS" -I{} sh -c '
     src="$1"
     out="$2/$(basename "$src" .cpp).o"
-    exec "$3" c++ '"$CXX_FLAGS"' -c "$src" -o "$out"
+    exec "$3" c++ '"$CXX_FLAGS"' -O3 -fno-math-errno -c "$src" -o "$out"
 ' _ {} "$BDIR/obj" "$ZIG_BIN"
 
 # 5. Link vf2.aarch64 against link-time SDL2 stub + static libz.a + static libimgui.a

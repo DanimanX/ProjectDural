@@ -131,6 +131,8 @@ public:
 		u32 side_colour[2] = {};
 		const u32 *side_px = nullptr;
 		bool gpu3d = false;   // the 3D drawn by the host's gpu3d (has3d: something to show), not in px3d
+		bool bd_unpadded = false; // backdrop points directly to m_sys24 (width w, no PAD border)
+		u32 pen0 = 0;         // background pen 0 colour
 	};
 	// The 3D on the GPU (the host's, src/gpu/gpu3d.h): given `gpu`, the 3D isn't drawn on the CPU
 	// but handed over: gpu(video, picture) with the RAMs as that picture's frame left them (its
@@ -191,6 +193,8 @@ public:
 	bool newest_3d_cut() { return m_video->smooth() && m_video->newest_cut(); }
 	// The 3D drawn only for the frames shown (model2_video::defer_drawing): the same pictures.
 	void defer_3d(bool on) { render_wait(); m_video->defer_drawing(on); }
+	void set_external_gpu(bool on) { render_wait(); m_video->set_external_gpu(on); }
+	void set_skip_z80(bool on) { m_skip_z80 = on; }
 	// The 3D drawn at `scale` (1-8) times the arcade's resolution; the 2D layers, drawn at the
 	// arcade's, are enlarged to it pixel for pixel (each a square block: as sharp as they are).
 	// 1 is MAME's picture, exactly.
@@ -621,6 +625,7 @@ private:
 	std::unique_ptr<model2_video> m_video;
 	bool m_sound_on = false;
 	bool m_sound_only = false;
+	bool m_skip_z80 = false;
 	std::deque<uint8_t> m_snd_queue;   // (sound_only: the bytes to go to the sound board)
 	atime m_snd_next = 0;              // (and when the next may)
 	void snd_link_byte();              // (T_UART on a sound board alone: the next of them in)

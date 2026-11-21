@@ -679,6 +679,7 @@ void model2a::reset()
 	if (!m_link_fast && !m_sound_only) timer_adjust(T_UART, AS_PER_SEC / 1000000);   // (a sound board alone: its bytes' own, sound_bytes)
 	irq_update();
 	set_input_line(L_TGP_HALT, ASSERT_LINE);   // model2_tgp_state: the TGP waits for its program
+	if (m_skip_z80) suspend(CPU_Z80, SUSPEND_HALT);
 }
 
 void model2a::power_on()
@@ -1238,7 +1239,7 @@ void model2a::timer_fired(int id)
 		timer_adjust(T_VBLANK_END, atime(VBLANK_CYCLES) * m_sched[CPU_I960].period);
 		m_framenum = u32(m_frame_number);
 		// if 60 Hz mode or frame number is even, trigger geometrizer to start new frame
-		if ((m_videocontrol & 1) == 0 || (m_framenum & 1) == 0) {
+		if (!m_sound_only && ((m_videocontrol & 1) == 0 || (m_framenum & 1) == 0)) {
 			m_video->m_geo_frame = m_frame_number;   // (smooth motion's)
 			m_video->geo_parse();
 		}
@@ -1251,7 +1252,7 @@ void model2a::timer_fired(int id)
 	}
 	case T_VBLANK_END:   // MAME draws the screen here, then counts the frame
 		render_wait();   // (a picture still being drawn: its polygons, before the next frame's)
-		if (m_draw_3d) m_video->frame_end(m_render_test_mode, m_frame_number);
+		if (m_draw_3d && !m_sound_only) m_video->frame_end(m_render_test_mode, m_frame_number);
 		m_frame_number++;
 		break;
 	case T_TIMER0: case T_TIMER1: case T_TIMER2: case T_TIMER3: timer_fire(id - T_TIMER0); break;
@@ -2036,7 +2037,7 @@ void model2a::before_3d_ram_change(int kind, u32 offset, u32 old, u32 now)
 	note_gpu_ram(kind);
 	// (the 3D still to be shown drawn now, in the RAMs as they are, unless the lists and the
 	// changes are kept: then each is drawn when shown, the changes since taken back)
-	if (m_video->deferred() && (!m_video->smooth() || m_ram_log.size() >= 1000000)) {
+	if (m_video->deferred() && !m_video->external_gpu() && (!m_video->smooth() || m_ram_log.size() >= 1000000)) {
 		const auto t0 = std::chrono::steady_clock::now();
 		if (!m_video->smooth()) m_video->draw_deferred();
 		else   // (the changes kept are about to be dropped: the pictures still to be shown drawn first, each in its frame's colours)
@@ -2221,18 +2222,44 @@ void model2a::draw_picture(u32 *out, size_t stride, bool polygons, bool async, f
 	// taken back meanwhile, as smooth motion's are.
 	// (the GPU's way: the picture shown isn't marked drawn, its map left as it was, unless the CPU
 	// draws it too)
-	const bool gpu_way = parts && gpu && !x0 && !framebuffer;
+	const bool gpu_way = parts && gpu && !framebuffer;
 	if (parts) {
 		parts->w = w; parts->s = s;
 		parts->version = m_2d_version;
-		parts->backdrop = m_bd_pad.data();
+		parts->bd_unpadded = !smooth && !m_video->smooth();
+		parts->backdrop = parts->bd_unpadded ? &m_sys24.pix(0) : m_bd_pad.data();
 		parts->mid = &m_sys24_mid.pix(0);
 		parts->top = &m_sys24_top.pix(0);
 		parts->filter = smooth;
 		parts->bdx = bdx; parts->bdy = bdy;
+		parts->pen0 = m_pens[0];
 		parts->sides = 0;
 		parts->side_px = nullptr;
 	}
+	auto fill_43_sides = [&](const bitmap_rgb32 *l3d) {
+		if (!x0 || !parts) return;
+		const int W = w * s, H = HEIGHT * s;
+		const u32 pen0 = m_pens[0];
+		u32 edge[2 * HEIGHT];
+		for (int side = 0; side < 2; side++) {
+			const int X = side ? (e + WIDTH) * s - 1 : e * s, x = X / s;
+			for (int y = 0; y < HEIGHT; y++) {
+				const int Y = y * s;
+				u32 c = m_sys24_top.pix(y, x);
+				if (!c && l3d) c = l3d->pix(Y, X);
+				if (!c) c = m_sys24_mid.pix(y, x);
+				if (!c) {
+					c = bdx || bdy ? m_sys24.pix(std::clamp(Y + bdy, 0, H - 1) / s, std::clamp(X + bdx, 0, W - 1) / s) : m_sys24.pix(y, x);
+					if (!c) c = pen0;
+				}
+				edge[side * HEIGHT + y] = c;
+			}
+		}
+		const size_t sw = size_t(2) * e * s;
+		if (m_side_px.size() != sw * H) m_side_px.assign(sw * H, 0);
+		parts->sides = fill_sides(m_side_px.data(), sw, edge, WIDTH * s, parts->side_colour);
+		if (parts->sides == 2) parts->side_px = m_side_px.data();
+	};
 	if (gpu_way) {   // the 3D handed to the GPU, in its own frame's colours
 		const int gp = smooth_pic >= 0 ? smooth_pic : polygons ? m_video->shown_index() : -1;
 		bool ok = true;
@@ -2242,6 +2269,7 @@ void model2a::draw_picture(u32 *out, size_t stride, bool polygons, bool async, f
 			if (back) ram_log_apply(f, true);
 			ok = (*gpu)(*m_video, gp);
 			if (back) ram_log_apply(f, false);
+			if (ok) m_video->picture_drawn(gp);
 		}
 		if (ok) {
 			parts->gpu3d = true;
@@ -2249,6 +2277,7 @@ void model2a::draw_picture(u32 *out, size_t stride, bool polygons, bool async, f
 			parts->map3d = nullptr;
 			parts->map_stride = 0;
 			parts->rows3d[0] = 0; parts->rows3d[1] = HEIGHT * s;
+			fill_43_sides(nullptr);
 			if (!also_cpu) return;
 		}
 	}
@@ -2438,7 +2467,7 @@ void model2a::draw_2d(bool polygons, bool parts)
 	m_2d_wide = wide;
 	m_2d_filter = smooth;
 	m_2d_version++;
-	if (parts) {   // the backdrop PAD pixels larger each way, its edges carried on; opaque
+	if (parts && (smooth || m_video->smooth())) {   // the backdrop PAD pixels larger each way, its edges carried on; opaque
 		constexpr int P = picture_parts::PAD;
 		const int pw = w + 2 * P;
 		m_bd_pad.resize(size_t(pw) * (HEIGHT + 2 * P));

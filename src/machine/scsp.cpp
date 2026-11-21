@@ -962,6 +962,7 @@ void scsp_device::w16(u32 addr, u16 val)
 		else if (addr < 0xC00)
 		{
 			*((uint16_t *) (m_DSP.MPRO + (addr - 0x800) / 2)) = val;
+			m_DSP.MarkDirty();
 
 			if (addr == 0xBF0)
 			{
@@ -1209,19 +1210,36 @@ inline s32 scsp_device::UpdateSlot(SCSP_SLOT *slot)
 
 void scsp_device::DoMasterSamples(int samples)
 {
+#if !SCSP_FM_DELAY
+	int active_slots[32];
+	int n_active = 0;
+	bool any_fm = false;
+	for (int sl = 0; sl < 32; ++sl) {
+		if (m_Slots[sl].active) {
+			active_slots[n_active++] = sl;
+			if (MDL((m_Slots + sl))) any_fm = true;
+		}
+	}
+#endif
+
 	for (int s = 0; s < samples; ++s)
 	{
 		s32 smpl = 0, smpr = 0;
 		s32 fxl = 0, fxr = 0, fxd = 0;   // the effects' direct output and their send to the DSP, before their volume and the leveller
 
+#if !SCSP_FM_DELAY
+		const int loop_count = any_fm ? 32 : n_active;
+		for (int i = 0; i < loop_count; ++i)
+		{
+			const int sl = any_fm ? i : active_slots[i];
+			m_RBUFDST = m_RINGBUF + ((m_BUFPTR + sl) & 63);
+			if (!any_fm || m_Slots[sl].active)
+#else
 		for (int sl = 0; sl < 32; ++sl)
 		{
-#if SCSP_FM_DELAY
 			m_RBUFDST = m_DELAYBUF + m_DELAYPTR;
-#else
-			m_RBUFDST = m_RINGBUF + m_BUFPTR;
-#endif
 			if (m_Slots[sl].active)
+#endif
 			{
 				SCSP_SLOT *slot = m_Slots + sl;
 				u16 Enc;
@@ -1271,14 +1289,15 @@ void scsp_device::DoMasterSamples(int samples)
 
 #if SCSP_FM_DELAY
 			m_RINGBUF[(m_BUFPTR + 64 - (SCSP_FM_DELAY - 1)) & 63] = m_DELAYBUF[(m_DELAYPTR + SCSP_FM_DELAY - (SCSP_FM_DELAY - 1)) % SCSP_FM_DELAY];
-#endif
 			++m_BUFPTR;
 			m_BUFPTR &= 63;
-#if SCSP_FM_DELAY
 			++m_DELAYPTR;
 			if (m_DELAYPTR > SCSP_FM_DELAY-1) m_DELAYPTR = 0;
 #endif
 		}
+#if !SCSP_FM_DELAY
+		m_BUFPTR = (m_BUFPTR + 32) & 63;
+#endif
 
 		if (m_dsp_enabled) m_DSP.Step();
 

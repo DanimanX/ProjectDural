@@ -154,6 +154,8 @@ public:
 	void defer_drawing(bool on);
 	bool deferred() const { return m_deferred; }
 	void draw_deferred();
+	void set_external_gpu(bool on) { m_external_gpu = on; }
+	bool external_gpu() const { return m_external_gpu; }
 	void model2_3d_zclip_w(u32 data);
 	u32 polygon_count_r();
 	uint64_t m_polygon_count_sum = 0xcbf29ce484222325ull;   // (a running hash of every count the game read: VF2_TEST_RAM_LOG)
@@ -309,6 +311,7 @@ private:
 	int m_shown[3] = { -1, -1, -1 };
 	int m_delay = 0;
 	bool m_defer = false, m_deferred = false;   // deferring; a picture's polygons not drawn yet
+	bool m_external_gpu = false;                // 3D drawn by external GPU; skip CPU raster_drawn()
 	int shown_now() const { return m_shown[2 - m_delay]; }
 	int m_scale = 1, m_ext = 0;
 	int16_t m_crtc_xoffset = 0, m_crtc_yoffset = 0;

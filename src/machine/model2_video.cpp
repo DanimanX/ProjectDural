@@ -1325,7 +1325,7 @@ void model2_video::render_polygons()
 	m_pic_frame[pic] = m_parsed_frame;
 	static texdump *const dump = getenv("VF2_DUMP_TEXTURES") ? new texdump(getenv("VF2_DUMP_TEXTURES")) : nullptr;
 	if (dump) dump->add(m_pictures[pic].drawn, *this, m_parsed_frame);
-	if (m_defer) m_pictures[pic].deferred = m_deferred = true;
+	if (m_defer || m_external_gpu) m_pictures[pic].deferred = m_deferred = true;
 	else raster_drawn(pic);
 
 	show(pic);

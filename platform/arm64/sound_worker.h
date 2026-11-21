@@ -8,6 +8,7 @@
 #include "thread_affinity.h"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <memory>
@@ -99,6 +100,7 @@ public:
     }
 
     uint64_t samples_total() const { return samples_total_.load(std::memory_order_relaxed); }
+    double last_work_ms() const { return last_work_ms_.load(std::memory_order_relaxed); }
 
     void close() {
         if (thread_.joinable()) {
@@ -132,6 +134,7 @@ private:
                 mvol = music_vol_; svol = sfx_vol_;
                 dsp = dsp_enabled_;
             }
+            const auto t0 = std::chrono::steady_clock::now();
             if (do_vol) snd_->set_volumes(mvol, svol);
             if (do_dsp) snd_->scsp().set_dsp_enabled(dsp);
             if (!bytes.empty()) snd_->sound_bytes(bytes.data(), bytes.size());
@@ -141,6 +144,8 @@ private:
                 if (audio_) audio_->push(snd_->m_audio_out.data(), snd_->m_audio_out.size());
                 snd_->m_audio_out.clear();
             }
+            const double work_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            last_work_ms_.store(work_ms, std::memory_order_relaxed);
             {
                 std::lock_guard<std::mutex> lk(mu_);
                 busy_ = false;
@@ -165,6 +170,7 @@ private:
     float music_vol_ = 1.0f;
     float sfx_vol_ = 1.0f;
     std::atomic<uint64_t> samples_total_{0};
+    std::atomic<double> last_work_ms_{0.0};
 };
 
 } // namespace arm64

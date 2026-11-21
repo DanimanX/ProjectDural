@@ -33,6 +33,20 @@ struct SCSPDSP
 	bool Stopped;
 	int LastStep;
 
+	struct DecodedStep {
+		u32 TRA;
+		u8 TWT, TWA;
+		u8 XSEL, YSEL, IRA, IWT, IWA;
+		u8 TABLE, MWT, MRD, EWT, EWA;
+		u8 ADRL, FRCL, SHIFT, YRL, NEGB, ZERO, BSEL;
+		u8 NOFL, COEF, MASA, ADREB, NXADR;
+		bool nop;
+	};
+	DecodedStep m_decoded[128];
+	bool m_dirty = true;
+	void MarkDirty() { m_dirty = true; }
+	void DecodeSteps();
+
 	void Init();
 	void SetSample(s32 sample, s32 SEL, s32 MXL);
 	void Step();

@@ -80,6 +80,8 @@ public:
     size_t last_batch_count() const { return last_batch_count_; }
     size_t cached_tex_bytes() const { return cached_bytes_; }
     size_t cached_tex_count() const { return sources_.size(); }
+    uint32_t last_tex_clears() const { return last_tex_clears_; }
+    uint32_t last_pal_clears() const { return last_pal_clears_; }
 
 private:
     struct TexKey {
@@ -110,6 +112,10 @@ private:
                           uint32_t format, const void *pixels);
     void update_texture_rgba(uint32_t &tex, int &cur_w, int &cur_h, int w, int h, bool linear,
                              const uint32_t *argb, size_t stride_px);
+    void update_texture_2d_rgb565(uint32_t &tex, int &cur_w, int &cur_h, int w, int h, bool linear,
+                                  const uint32_t *argb, size_t stride_px, std::vector<uint16_t> &shadow);
+    void update_texture_2d_rgba5551(uint32_t &tex, int &cur_w, int &cur_h, int w, int h, bool linear,
+                                    const uint32_t *argb, size_t stride_px, std::vector<uint16_t> &shadow);
     const TexSource *source_for(const gpu3d_poly &poly, const gpu3d_rams &rams);
     int palette_row(const gpu3d_poly &poly, const gpu3d_rams &rams);
     void clear_tex_cache();
@@ -150,8 +156,11 @@ private:
     bool have_gamma_ = false;
 
     std::vector<uint32_t> swizzle_scratch_;
+    std::vector<uint16_t> bd_shadow_, mid_shadow_, top_shadow_;
     size_t last_poly_count_ = 0;
     size_t last_batch_count_ = 0;
+    uint32_t last_tex_clears_ = 0;
+    uint32_t last_pal_clears_ = 0;
 };
 
 } // namespace arm64

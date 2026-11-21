@@ -12,14 +12,8 @@ u16 PACK(s32 val)
 {
 	int const sign = BIT(val, 23);
 	u32 temp = (val ^ (val << 1)) & 0xFFFFFF;
-	int exponent = 0;
-	for (int k = 0; k < 12; k++)
-	{
-		if (temp & 0x800000)
-			break;
-		temp <<= 1;
-		exponent += 1;
-	}
+	int exponent = temp ? std::min(12, __builtin_clz(temp) - 8) : 12;
+	temp <<= exponent;
 	if (exponent < 12)
 		val = (val << exponent) & 0x3FFFFF;
 	else
@@ -67,12 +61,51 @@ void SCSPDSP::Init()
 	ram_bytes = n;
 	RBL = (8*1024); // Initial RBL is 0
 	Stopped = true;
+	m_dirty = true;
+}
+
+void SCSPDSP::DecodeSteps()
+{
+	for (int step = 0; step < 128; ++step)
+	{
+		const u16 *const IPtr = MPRO + (step * 4);
+		DecodedStep &d = m_decoded[step];
+		d.nop   = (!IPtr[0] && !IPtr[1] && !IPtr[2] && !IPtr[3]);
+		d.TRA   = (IPtr[0] >>  8) & 0x7f;
+		d.TWT   = (IPtr[0] >>  7) & 0x01;
+		d.TWA   = (IPtr[0] >>  0) & 0x7f;
+		d.XSEL  = (IPtr[1] >> 15) & 0x01;
+		d.YSEL  = (IPtr[1] >> 13) & 0x03;
+		d.IRA   = (IPtr[1] >>  6) & 0x3f;
+		d.IWT   = (IPtr[1] >>  5) & 0x01;
+		d.IWA   = (IPtr[1] >>  0) & 0x1f;
+		d.TABLE = (IPtr[2] >> 15) & 0x01;
+		d.MWT   = (IPtr[2] >> 14) & 0x01;
+		d.MRD   = (IPtr[2] >> 13) & 0x01;
+		d.EWT   = (IPtr[2] >> 12) & 0x01;
+		d.EWA   = (IPtr[2] >>  8) & 0x0f;
+		d.ADRL  = (IPtr[2] >>  7) & 0x01;
+		d.FRCL  = (IPtr[2] >>  6) & 0x01;
+		d.SHIFT = (IPtr[2] >>  4) & 0x03;
+		d.YRL   = (IPtr[2] >>  3) & 0x01;
+		d.NEGB  = (IPtr[2] >>  2) & 0x01;
+		d.ZERO  = (IPtr[2] >>  1) & 0x01;
+		d.BSEL  = (IPtr[2] >>  0) & 0x01;
+		d.NOFL  = (IPtr[3] >> 15) & 0x01;
+		d.COEF  = (IPtr[3] >>  9) & 0x3f;
+		d.MASA  = (IPtr[3] >>  2) & 0x1f;
+		d.ADREB = (IPtr[3] >>  1) & 0x01;
+		d.NXADR = (IPtr[3] >>  0) & 0x01;
+	}
+	m_dirty = false;
 }
 
 void SCSPDSP::Step()
 {
 	if (Stopped)
 		return;
+	if (m_dirty)
+		DecodeSteps();
 
 	std::fill(std::begin(EFREG), std::end(EFREG), 0);
 
@@ -91,40 +124,39 @@ void SCSPDSP::Step()
 
 	for (int step = 0; step < /*128*/LastStep; ++step)
 	{
-		u16 *const IPtr = MPRO + (step * 4);
+		const DecodedStep &d = m_decoded[step];
+		if (d.nop)
+			continue;
 
-		//if (!IPtr[0] && !IPtr[1] && !IPtr[2] && !IPtr[3])
-			//break;
+		u32 const TRA   = d.TRA;
+		u32 const TWT   = d.TWT;
+		u32 const TWA   = d.TWA;
 
-		u32 const TRA   = (IPtr[0] >>  8) & 0x7f;
-		u32 const TWT   = (IPtr[0] >>  7) & 0x01;
-		u32 const TWA   = (IPtr[0] >>  0) & 0x7f;
+		u32 const XSEL  = d.XSEL;
+		u32 const YSEL  = d.YSEL;
+		u32 const IRA   = d.IRA;
+		u32 const IWT   = d.IWT;
+		u32 const IWA   = d.IWA;
 
-		u32 const XSEL  = (IPtr[1] >> 15) & 0x01;
-		u32 const YSEL  = (IPtr[1] >> 13) & 0x03;
-		u32 const IRA   = (IPtr[1] >>  6) & 0x3f;
-		u32 const IWT   = (IPtr[1] >>  5) & 0x01;
-		u32 const IWA   = (IPtr[1] >>  0) & 0x1f;
+		u32 const TABLE = d.TABLE;
+		u32 const MWT   = d.MWT;
+		u32 const MRD   = d.MRD;
+		u32 const EWT   = d.EWT;
+		u32 const EWA   = d.EWA;
+		u32 const ADRL  = d.ADRL;
+		u32 const FRCL  = d.FRCL;
+		u32 const SHIFT = d.SHIFT;
+		u32 const YRL   = d.YRL;
+		u32 const NEGB  = d.NEGB;
+		u32 const ZERO  = d.ZERO;
+		u32 const BSEL  = d.BSEL;
 
-		u32 const TABLE = (IPtr[2] >> 15) & 0x01;
-		u32 const MWT   = (IPtr[2] >> 14) & 0x01;
-		u32 const MRD   = (IPtr[2] >> 13) & 0x01;
-		u32 const EWT   = (IPtr[2] >> 12) & 0x01;
-		u32 const EWA   = (IPtr[2] >>  8) & 0x0f;
-		u32 const ADRL  = (IPtr[2] >>  7) & 0x01;
-		u32 const FRCL  = (IPtr[2] >>  6) & 0x01;
-		u32 const SHIFT = (IPtr[2] >>  4) & 0x03;
-		u32 const YRL   = (IPtr[2] >>  3) & 0x01;
-		u32 const NEGB  = (IPtr[2] >>  2) & 0x01;
-		u32 const ZERO  = (IPtr[2] >>  1) & 0x01;
-		u32 const BSEL  = (IPtr[2] >>  0) & 0x01;
+		u32 const NOFL  = d.NOFL;
+		u32 const COEF  = d.COEF;
 
-		u32 const NOFL  = (IPtr[3] >> 15) & 0x01;  //????
-		u32 const COEF  = (IPtr[3] >>  9) & 0x3f;
-
-		u32 const MASA  = (IPtr[3] >>  2) & 0x1f;  //???
-		u32 const ADREB = (IPtr[3] >>  1) & 0x01;
-		u32 const NXADR = (IPtr[3] >>  0) & 0x01;
+		u32 const MASA  = d.MASA;
+		u32 const ADREB = d.ADREB;
+		u32 const NXADR = d.NXADR;
 
 		//operations are done at 24 bit precision
 #if 0

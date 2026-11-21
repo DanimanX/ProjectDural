@@ -303,6 +303,8 @@ int run_rom_bench(const std::string &rom_path, int frames, bool interp) {
     model2a m(std::move(roms), !interp);
     m.set_sound(false);
     m.set_byte_link(true);
+    m.set_skip_z80(true);
+    m.set_external_gpu(true);
     std::vector<uint8_t> uart;
     m.on_uart_tx = [&](uint8_t b) { uart.push_back(b); };
     m.reset();
@@ -312,6 +314,7 @@ int run_rom_bench(const std::string &rom_path, int frames, bool interp) {
                 st.functions, st.native, st.instructions, st.ms);
 
     const uint64_t t0 = ticks_us();
+    uint64_t emu_us = 0, snd_us = 0, ren_us = 0;
     size_t total_polys = 0;
     std::vector<gpu3d_poly> polys;
     model2a::picture_parts parts;
@@ -321,17 +324,25 @@ int run_rom_bench(const std::string &rom_path, int frames, bool interp) {
         return true;
     };
     for (int f = 0; f < frames; ++f) {
+        const uint64_t a = ticks_us();
         uart.clear();
         m.run_frame();
+        const uint64_t b = ticks_us();
         snd.wait();
         snd.submit(std::move(uart));
+        const uint64_t c = ticks_us();
         m.render_parts(-1.0f, nullptr, 0, false, parts, &hook, false, false);
+        const uint64_t d = ticks_us();
+        emu_us += (b - a);
+        snd_us += (c - b);
+        ren_us += (d - c);
     }
     snd.wait();
     snd.close();
     const double ms = double(ticks_us() - t0) / 1000.0;
-    std::printf("[bench] %d frames in %.2f ms (%.2f FPS), avg polys=%.1f\n",
-                frames, ms, double(frames) * 1000.0 / std::max(ms, 0.001), double(total_polys) / frames);
+    std::printf("[bench] %d frames in %.2f ms (%.2f FPS), avg polys=%.1f | emu=%.2fms snd_wait=%.2fms export=%.2fms\n",
+                frames, ms, double(frames) * 1000.0 / std::max(ms, 0.001), double(total_polys) / frames,
+                double(emu_us) / (1000.0 * frames), double(snd_us) / (1000.0 * frames), double(ren_us) / (1000.0 * frames));
     return 0;
 }
 
@@ -357,6 +368,7 @@ int secret_code_from_idx(int idx) {
 void apply_board_settings(model2a &m, const Settings &s, arm64::SoundWorker &snd) {
     const float asp = (s.aspect == 0) ? 1.5f : (4.0f / 3.0f);
     m.set_aspect(asp);
+    m.set_external_gpu(s.gpu_3d);
     m.set_backdrop_filter(s.backdrop_filter);
     m.set_hud_hidden(s.hide_hud);
     m.set_debug_mode(s.debug_mode);
@@ -398,6 +410,7 @@ int main(int argc, char **argv) {
 
     arm64::pin_current_thread(kMainCore);
     arm64::set_current_thread_name("dural-main");
+    setenv("VF2_THREADS", "2", 0);
 
     if (cli.bench_synthetic > 0) return run_synthetic_bench(cli.bench_synthetic);
 
@@ -506,6 +519,7 @@ int main(int argc, char **argv) {
     std::unique_ptr<model2a> game = std::make_unique<model2a>(std::move(roms), !cli.interp);
     game->set_sound(false);
     game->set_byte_link(true);
+    game->set_skip_z80(true);
 
     std::vector<uint8_t> uart_bytes;
     game->on_uart_tx = [&](uint8_t b) { uart_bytes.push_back(b); };
@@ -571,9 +585,14 @@ int main(int argc, char **argv) {
 
     uint64_t next_frame_us = ticks_us();
     uint64_t fps_t0 = next_frame_us;
+    uint64_t log_t0 = next_frame_us;
     int fps_frames = 0;
+    int log_frames = 0;
     double current_fps = 57.524;
-    double last_emu_ms = 0.0;
+    double last_emu_ms = 0.0, last_ren_ms = 0.0, last_swap_ms = 0.0;
+    double sum_emu_ms = 0.0, sum_snd_ms = 0.0, sum_ren_ms = 0.0, sum_swap_ms = 0.0;
+    double sum_polys = 0.0, sum_batches = 0.0;
+    uint32_t prev_tex_clr = gpu.last_tex_clears(), prev_pal_clr = gpu.last_pal_clears();
 
     while (running) {
         SDL_Event e;
@@ -631,6 +650,7 @@ int main(int argc, char **argv) {
             }
 
             // Render frame
+            const uint64_t t_ren0 = ticks_us();
             arm64::gl_begin_frame();
             const arm64::AspectMode aspect_mode = static_cast<arm64::AspectMode>(cfg.aspect);
             model2a::picture_parts parts;
@@ -645,32 +665,64 @@ int main(int argc, char **argv) {
                 game->render_into(cpu_fb.data(), size_t(w), true);
                 gpu.draw_cpu_framebuffer(cpu_fb.data(), w, 384, aspect_mode);
             }
+            last_ren_ms = double(ticks_us() - t_ren0) / 1000.0;
 
             if (cfg.show_fps) {
                 imgui.frame(1.0f / 60.0f);
                 ImGui::SetNextWindowPos({8.0f, 8.0f}, ImGuiCond_Always);
                 ImGui::SetNextWindowBgAlpha(0.65f);
                 ImGui::Begin("##fps", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs);
-                ImGui::Text("FPS: %.1f | Emu: %.1f ms | Polys: %zu (%zu batches)",
-                            current_fps, last_emu_ms, gpu.last_poly_count(), gpu.last_batch_count());
+                ImGui::Text("FPS: %.1f | Emu:%.1f GPU:%.1f Swap:%.1f Snd:%.1f | P:%zu(%zu)",
+                            current_fps, last_emu_ms, last_ren_ms, last_swap_ms,
+                            sound_worker.last_work_ms(), gpu.last_poly_count(), gpu.last_batch_count());
                 ImGui::End();
                 imgui.render();
             }
+            const uint64_t t_swap0 = ticks_us();
             arm64::gl_end_frame();
+            const uint64_t now = ticks_us();
+            last_swap_ms = double(now - t_swap0) / 1000.0;
 
             ++fps_frames;
-            const uint64_t now = ticks_us();
+            ++log_frames;
+            sum_emu_ms += last_emu_ms;
+            sum_snd_ms += sound_worker.last_work_ms();
+            sum_ren_ms += last_ren_ms;
+            sum_swap_ms += last_swap_ms;
+            sum_polys += double(gpu.last_poly_count());
+            sum_batches += double(gpu.last_batch_count());
+
             if (now - fps_t0 >= 500000ull) {
                 current_fps = double(fps_frames) * 1000000.0 / double(now - fps_t0);
                 fps_frames = 0;
                 fps_t0 = now;
             }
-            const uint64_t period_us = cfg.sync_60hz ? 16667ull : 17384ull;
-            next_frame_us += period_us;
-            if (now < next_frame_us) {
-                const uint64_t wait_ms = (next_frame_us - now) / 1000ull;
-                if (wait_ms > 1) SDL_Delay(Uint32(wait_ms - 1));
-            } else if (now - next_frame_us > period_us * 4) {
+            if (now - log_t0 >= 5000000ull && log_frames > 0) {
+                const double lf = double(log_frames) * 1000000.0 / double(now - log_t0);
+                const uint32_t tc = gpu.last_tex_clears();
+                const uint32_t pc = gpu.last_pal_clears();
+                std::fprintf(stderr,
+                             "[perf] fps=%.1f emu=%.2fms snd=%.2fms gpu=%.2fms swap=%.2fms polys=%.0f batches=%.0f tex=%.1fMB tex_clr=%u pal_clr=%u\n",
+                             lf, sum_emu_ms / log_frames, sum_snd_ms / log_frames, sum_ren_ms / log_frames,
+                             sum_swap_ms / log_frames, sum_polys / log_frames, sum_batches / log_frames,
+                             double(gpu.cached_tex_bytes()) / (1024.0 * 1024.0),
+                             tc - prev_tex_clr, pc - prev_pal_clr);
+                prev_tex_clr = tc;
+                prev_pal_clr = pc;
+                log_frames = 0;
+                log_t0 = now;
+                sum_emu_ms = sum_snd_ms = sum_ren_ms = sum_swap_ms = sum_polys = sum_batches = 0.0;
+            }
+            if (!cfg.vsync) {
+                const uint64_t period_us = cfg.sync_60hz ? 16667ull : 17384ull;
+                next_frame_us += period_us;
+                if (now < next_frame_us) {
+                    const uint64_t wait_ms = (next_frame_us - now) / 1000ull;
+                    if (wait_ms > 1) SDL_Delay(Uint32(wait_ms - 1));
+                } else if (now - next_frame_us > period_us * 4) {
+                    next_frame_us = now;
+                }
+            } else {
                 next_frame_us = now;
             }
         } else {
@@ -735,7 +787,7 @@ int main(int argc, char **argv) {
                     cfg.aspect = (cfg.aspect + (lr < 0 ? 2 : 1)) % 3;
                     apply_board_settings(*game, cfg, sound_worker);
                 }
-                if (row(1, "3D Renderer", cfg.gpu_3d ? "GLES 2.0 (Mali)" : "CPU Software")) cfg.gpu_3d = !cfg.gpu_3d;
+                if (row(1, "3D Renderer", cfg.gpu_3d ? "GLES 2.0 (Mali)" : "CPU Software")) { cfg.gpu_3d = !cfg.gpu_3d; game->set_external_gpu(cfg.gpu_3d); }
                 if (row(2, "Backdrop Filter", cfg.backdrop_filter ? "Smooth" : "Sharp")) {
                     cfg.backdrop_filter = !cfg.backdrop_filter;
                     apply_board_settings(*game, cfg, sound_worker);
