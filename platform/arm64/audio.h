@@ -70,6 +70,9 @@ public:
                     cur_[0] = float(in[2 * used]) * (1.0f / 32768.0f);
                     cur_[1] = float(in[2 * used + 1]) * (1.0f / 32768.0f);
                     ++used;
+                } else {
+                    cur_[0] *= 0.992f;
+                    cur_[1] *= 0.992f;
                 }
             }
         }
@@ -139,6 +142,14 @@ public:
         playing_ = false;
     }
 
+    int queued_frames() {
+        if (!device_) return 0;
+        SDL_LockAudioDevice(device_);
+        const int q = queued_frames_locked();
+        SDL_UnlockAudioDevice(device_);
+        return q;
+    }
+
     Stats stats() {
         Stats out;
         if (!device_) return out;
@@ -198,12 +209,11 @@ private:
         while (frames > 0) {
             const int n = std::min(frames, kChunk);
             const int need = self.resampler_.needed(n, ratio);
+            int got = std::min(need, kMaxInput);
             if (need > queued) {
                 ++self.underruns_;
-                self.restart_locked();
-                return;
+                got = std::min(queued, kMaxInput);
             }
-            const int got = std::min(need, kMaxInput);
             if (got > 0) {
                 SDL_AudioStreamGet(self.stream_, self.in_buf_, got * kFrameBytes);
             }

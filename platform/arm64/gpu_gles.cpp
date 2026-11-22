@@ -23,8 +23,8 @@ attribute vec3 a_pos;    // x * w, y * w (display pixels, top-left origin), w
 attribute vec4 a_uvpd;   // u_norm, v_norm, palette row coord, priority depth [0..1]
 attribute vec4 a_color;
 uniform vec2 u_inv_screen;
-varying vec3 v_uvp;
-varying vec4 v_color;
+varying highp vec3 v_uvp;
+varying mediump vec4 v_color;
 void main() {
     float w = a_pos.z;
     float z = (2.0 * a_uvpd.w - 1.0) * w;
@@ -37,8 +37,8 @@ void main() {
 )";
 
 const char *const kFragmentShader = R"(
-varying vec3 v_uvp;
-varying vec4 v_color;
+varying highp vec3 v_uvp;
+varying mediump vec4 v_color;
 #ifdef TEXTURED
 uniform sampler2D s_tex;
 #endif
@@ -47,17 +47,17 @@ uniform sampler2D s_palette;
 #endif
 void main() {
 #ifdef CHECKER
-    vec2 p = floor(gl_FragCoord.xy);
-    float s = p.x + p.y;
+    highp vec2 p = floor(gl_FragCoord.xy);
+    highp float s = p.x + p.y;
     if (s - 2.0 * floor(s * 0.5) < 0.5) { discard; }
 #endif
 #ifdef TEXTURED
-    vec4 t = texture2D(s_tex, v_uvp.xy);
+    mediump vec4 t = texture2D(s_tex, v_uvp.xy);
 #ifdef ALPHA_TEST
     if (t.a < 0.5) { discard; }
 #endif
 #ifdef MODEL
-    float k = floor(t.r * 127.5 + 0.01);
+    mediump float k = floor(t.r * 127.5 + 0.01);
     gl_FragColor = texture2D(s_palette, vec2((k + 0.5) * (1.0 / 128.0), v_uvp.z)) * v_color;
 #else
     gl_FragColor = t * v_color;
@@ -113,6 +113,7 @@ struct Batch {
     int clip = -1;
     Prog prog = Prog::Flat;
     GLuint texture = 0;
+    float max_depth = 0.0f;
     std::vector<PolyRef> poly_refs;
 };
 
@@ -143,7 +144,9 @@ struct State {
 
     GLuint program[int(Prog::Count)] = {};
     GLint u_inv_screen[int(Prog::Count)] = {};
-    GLuint vbo = 0;
+    static constexpr size_t kVboRing = 3;
+    GLuint vbo[kVboRing] = {};
+    size_t vbo_idx = 0;
     GLuint quad_ibo = 0;
     GLuint palette_texture = 0;
 
@@ -152,8 +155,12 @@ struct State {
     std::vector<std::array<int, 4>> clips;
     int clip = -1;
     std::vector<Batch> batches;
+    std::vector<uint32_t> batch_order;
     size_t batch_count = 0;
-    std::unordered_map<uint64_t, uint32_t> batch_index;
+    static constexpr size_t kBatchHashSize = 2048; // power-of-2 open-addressed hash table
+    struct BatchHashSlot { uint64_t key = 0; uint32_t idx = 0; uint32_t gen = 0; };
+    BatchHashSlot batch_hash[kBatchHashSize] = {};
+    uint32_t batch_gen = 1;
 
     char error[512] = {};
 } g;
@@ -197,15 +204,12 @@ void swizzle_argb_to_rgba(const uint32_t *src, size_t src_stride, uint32_t *dst,
 #endif
 }
 
-bool buffer_all_zero(const uint32_t *p, int w, int h) {
-    const size_t n = size_t(w) * size_t(h);
-    for (size_t i = 0; i < n; ++i)
-        if (p[i] != 0) return false;
-    return true;
-}
-
 inline uint32_t argb_to_rgba(uint32_t c) {
     return (c & 0xff000000u) | ((c & 0xffu) << 16) | (c & 0xff00u) | ((c >> 16) & 0xffu);
+}
+
+inline uint16_t pack_rgb565(uint8_t r, uint8_t g, uint8_t b) {
+    return uint16_t(((uint32_t(r) & 0xf8u) << 8) | ((uint32_t(g) & 0xfcu) << 3) | (uint32_t(b) >> 3));
 }
 
 void push(Prog prog, GLuint texture, const Vertex *vertices, size_t count, Depth depth = Depth::Off, bool blend = true) {
@@ -241,18 +245,30 @@ int add_clip(const std::array<int, 4> &rect) {
     return int(g.clips.size() - 1);
 }
 
-uint32_t batch_for(int clip, Prog prog, GLuint texture) {
+uint32_t batch_for(int clip, Prog prog, GLuint texture, float depth) {
     const uint64_t key = (uint64_t(uint16_t(clip)) << 40) | (uint64_t(prog) << 32) | texture;
-    auto it = g.batch_index.find(key);
-    if (it != g.batch_index.end()) return it->second;
+    uint64_t h = key;
+    h ^= h >> 33;
+    h *= 0xff51afd7ed558ccduLL;
+    size_t slot = size_t(h ^ (h >> 33)) & (State::kBatchHashSize - 1);
+    while (g.batch_hash[slot].gen == g.batch_gen) {
+        if (g.batch_hash[slot].key == key) {
+            const uint32_t idx = g.batch_hash[slot].idx;
+            if (depth > g.batches[idx].max_depth) g.batches[idx].max_depth = depth;
+            return idx;
+        }
+        slot = (slot + 1) & (State::kBatchHashSize - 1);
+    }
     if (g.batch_count == g.batches.size()) g.batches.emplace_back();
-    Batch &b = g.batches[g.batch_count];
+    const uint32_t idx = uint32_t(g.batch_count++);
+    Batch &b = g.batches[idx];
     b.clip = clip;
     b.prog = prog;
     b.texture = texture;
+    b.max_depth = depth;
     b.poly_refs.clear();
-    g.batch_index[key] = uint32_t(g.batch_count);
-    return uint32_t(g.batch_count++);
+    g.batch_hash[slot] = {key, idx, g.batch_gen};
+    return idx;
 }
 
 Vertex *append_quads(size_t quads) {
@@ -278,7 +294,10 @@ size_t write_fan_quads(Vertex *dst, const Vertex *v, int n) {
 void execute() {
     if (g.cmds.empty() || !g.verts.size) return;
     auto &gl = g.gl;
-    gl.glBindBuffer(GL_ARRAY_BUFFER, g.vbo);
+    const GLuint cur_vbo = g.vbo[g.vbo_idx];
+    g.vbo_idx = (g.vbo_idx + 1) % State::kVboRing;
+    gl.glBindBuffer(GL_ARRAY_BUFFER, cur_vbo);
+    gl.glBufferData(GL_ARRAY_BUFFER, GLsizeiptr(g.verts.size * sizeof(Vertex)), nullptr, GL_STREAM_DRAW);
     gl.glBufferData(GL_ARRAY_BUFFER, GLsizeiptr(g.verts.size * sizeof(Vertex)), g.verts.data(), GL_STREAM_DRAW);
     if (g.quad_ibo) gl.glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g.quad_ibo);
     for (GLuint i = 0; i < 3; ++i) gl.glEnableVertexAttribArray(i);
@@ -359,8 +378,10 @@ GLuint compile_shader(GLenum type, const char *header, const char *defines, cons
 }
 
 GLuint build_program(const ProgramDef &def, GLint &u_inv_out) {
-    const char *v_hdr = g.is_gles ? "#version 100\n" : "#version 120\n";
-    const char *f_hdr = g.is_gles ? "#version 100\nprecision highp float;\n" : "#version 120\n";
+    const char *v_hdr = g.is_gles ? "#version 100\nprecision highp float;\n"
+                                  : "#version 120\n#define highp\n#define mediump\n#define lowp\n";
+    const char *f_hdr = g.is_gles ? "#version 100\nprecision mediump float;\n"
+                                  : "#version 120\n#define highp\n#define mediump\n#define lowp\n";
     const GLuint vs = compile_shader(GL_VERTEX_SHADER, v_hdr, def.defines, kVertexShader, def.name);
     if (!vs) return 0;
     const GLuint fs = compile_shader(GL_FRAGMENT_SHADER, f_hdr, def.defines, kFragmentShader, def.name);
@@ -423,6 +444,24 @@ inline uint32_t get_texel(uint32_t base_x, uint32_t base_y, uint32_t x, uint32_t
     const uint32_t texel = sheet[offset >> 1];
     const uint32_t shift = ((offset & 1) << 4) + ((~y & 1u) << 3) + ((~x & 1u) << 2);
     return (texel >> shift) & 0x0f;
+}
+
+inline uint64_t hash_tex_rect(uint32_t base_x, uint32_t base_y, uint32_t w, uint32_t h, const uint32_t *sheet) {
+    uint64_t hval = 0xcbf29ce484222325ull;
+    for (uint32_t y = 0; y < h; y += 2) {
+        const uint32_t ry = base_y + y;
+        for (uint32_t x = 0; x < w; x += 4) {
+            uint32_t x2 = base_x + x;
+            uint32_t y2 = ry;
+            const uint32_t right = x2 >= 1024 ? 1024u : 0u;
+            x2 -= right;
+            y2 ^= right;
+            const uint32_t offset = ((y2 >> 1) << 9) + (x2 >> 1);
+            hval ^= sheet[offset >> 1];
+            hval *= 0x100000001b3ull;
+        }
+    }
+    return hval;
 }
 
 } // namespace
@@ -510,8 +549,8 @@ bool gl_init(const GlConfig &cfg) {
         g.u_inv_screen[int(Prog::ModelChecker)] = g.u_inv_screen[int(Prog::ModelAlpha)];
     }
 
-    gl.glGenBuffers(1, &g.vbo);
-    if (!g.vbo) {
+    gl.glGenBuffers(State::kVboRing, g.vbo);
+    if (!g.vbo[0]) {
         set_error("VBO creation failed");
         gl_fini();
         return false;
@@ -586,9 +625,10 @@ void gl_fini() {
             if (g.program[i] && !shared && gl.glDeleteProgram) gl.glDeleteProgram(g.program[i]);
             g.program[i] = 0;
         }
-        if (g.vbo && gl.glDeleteBuffers) gl.glDeleteBuffers(1, &g.vbo);
+        if (g.vbo[0] && gl.glDeleteBuffers) gl.glDeleteBuffers(State::kVboRing, g.vbo);
         if (g.quad_ibo && gl.glDeleteBuffers) gl.glDeleteBuffers(1, &g.quad_ibo);
-        g.vbo = g.quad_ibo = 0;
+        for (auto &v : g.vbo) v = 0;
+        g.quad_ibo = 0;
         SDL_GL_DeleteContext(g.ctx);
         g.ctx = nullptr;
     }
@@ -656,8 +696,22 @@ void gl_ui_triangles(uint32_t texture, const GlUiVertex *vertices, size_t count,
 
 GpuGlesRenderer::GpuGlesRenderer() {
     palette_shadow_.assign(size_t(kPaletteWidth) * kPaletteRows, 0u);
-    palette_texture_ = make_texture(kPaletteWidth, kPaletteRows, false, GL_CLAMP_TO_EDGE, GL_CLAMP_TO_EDGE,
-                                    GL_RGBA, palette_shadow_.data());
+    auto &gl = g.gl;
+    GLuint ptex = 0;
+    if (g.ready) {
+        gl.glGenTextures(1, &ptex);
+        if (ptex) {
+            gl.glActiveTexture(GL_TEXTURE0);
+            gl.glBindTexture(GL_TEXTURE_2D, ptex);
+            gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            gl.glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, kPaletteWidth, kPaletteRows, 0,
+                            GL_RGB, GL_UNSIGNED_SHORT_5_6_5, palette_shadow_.data());
+        }
+    }
+    palette_texture_ = ptex;
     g.palette_texture = palette_texture_;
     sources_.reserve(1024);
     ok_ = g.ready && palette_texture_ != 0;
@@ -703,105 +757,220 @@ void GpuGlesRenderer::update_texture_rgba(uint32_t &tex, int &cur_w, int &cur_h,
     }
 }
 
-void GpuGlesRenderer::update_texture_2d_rgb565(uint32_t &tex, int &cur_w, int &cur_h, int w, int h, bool linear,
-                                               const uint32_t *argb, size_t stride_px, std::vector<uint16_t> &shadow) {
+void GpuGlesRenderer::update_texture_2d_rgb565(LayerTex2D &layer, int w, int h, bool linear,
+                                               const uint32_t *argb, size_t stride_px) {
     if (w <= 0 || h <= 0 || !argb) return;
+    auto &gl = g.gl;
     const size_t total = size_t(w) * size_t(h);
-    const bool realloc_tex = (!tex || cur_w != w || cur_h != h || shadow.size() != total);
-    if (realloc_tex) shadow.resize(total);
-    int y_min = h, y_max = -1;
+    const bool realloc_tex = (!layer.tex[0] || !layer.tex[1] || layer.w != w || layer.h != h ||
+                              layer.shadow[0].size() != total || layer.shadow[1].size() != total);
+    if (realloc_tex) {
+        for (int i = 0; i < 2; ++i) {
+            if (layer.tex[i] && g.ready) { GLuint t = layer.tex[i]; gl.glDeleteTextures(1, &t); layer.tex[i] = 0; }
+            layer.shadow[i].assign(total, 0u);
+        }
+        layer.w = w;
+        layer.h = h;
+        layer.linear = linear;
+        layer.cur = 0;
+    } else {
+        layer.cur ^= 1u;
+    }
+
+    uint32_t &tex = layer.tex[layer.cur];
+    std::vector<uint16_t> &shadow = layer.shadow[layer.cur];
+    uint8_t row_dirty[512] = {};
+
     for (int y = 0; y < h; ++y) {
         const uint32_t *src = argb + size_t(y) * stride_px;
         uint16_t *dst = shadow.data() + size_t(y) * size_t(w);
-        bool row_dirty = realloc_tex;
-        for (int x = 0; x < w; ++x) {
+        uint32_t diff_acc = realloc_tex ? 1u : 0u;
+        int x = 0;
+#if defined(__aarch64__)
+        uint16x8_t vdiff = vdupq_n_u16(0);
+        for (; x + 8 <= w; x += 8) {
+            const uint32x4_t c0 = vld1q_u32(src + x);
+            const uint32x4_t c1 = vld1q_u32(src + x + 4);
+            const uint16x4_t p0 = vorr_u16(
+                vorr_u16(vand_u16(vshrn_n_u32(c0, 8), vdup_n_u16(0xf800u)),
+                         vand_u16(vshrn_n_u32(c0, 5), vdup_n_u16(0x07e0u))),
+                vand_u16(vshr_n_u16(vmovn_u32(c0), 3), vdup_n_u16(0x001fu)));
+            const uint16x4_t p1 = vorr_u16(
+                vorr_u16(vand_u16(vshrn_n_u32(c1, 8), vdup_n_u16(0xf800u)),
+                         vand_u16(vshrn_n_u32(c1, 5), vdup_n_u16(0x07e0u))),
+                vand_u16(vshr_n_u16(vmovn_u32(c1), 3), vdup_n_u16(0x001fu)));
+            const uint16x8_t p = vcombine_u16(p0, p1);
+            const uint16x8_t old = vld1q_u16(dst + x);
+            vdiff = vorrq_u16(vdiff, veorq_u16(old, p));
+            vst1q_u16(dst + x, p);
+        }
+        diff_acc |= vmaxvq_u16(vdiff);
+#endif
+        for (; x < w; ++x) {
             const uint32_t c = src[x];
             const uint16_t p = uint16_t(((c >> 8) & 0xf800u) | ((c >> 5) & 0x07e0u) | ((c >> 3) & 0x001fu));
-            if (dst[x] != p) {
-                dst[x] = p;
-                row_dirty = true;
-            }
+            diff_acc |= uint32_t(dst[x] ^ p);
+            dst[x] = p;
         }
-        if (row_dirty) {
-            if (y < y_min) y_min = y;
-            y_max = y + 1;
-        }
+        if (diff_acc && y < 512) row_dirty[y] = 1;
     }
-    auto &gl = g.gl;
+
     if (realloc_tex) {
-        if (tex && g.ready) { GLuint t = tex; gl.glDeleteTextures(1, &t); }
-        GLuint t = 0;
-        gl.glGenTextures(1, &t);
-        tex = t;
-        if (!tex) return;
-        gl.glActiveTexture(GL_TEXTURE0);
+        for (int i = 0; i < 2; ++i) {
+            GLuint t = 0;
+            gl.glGenTextures(1, &t);
+            layer.tex[i] = t;
+            if (!t) continue;
+            gl.glActiveTexture(GL_TEXTURE0);
+            gl.glBindTexture(GL_TEXTURE_2D, t);
+            gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, linear ? GL_LINEAR : GL_NEAREST);
+            gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, linear ? GL_LINEAR : GL_NEAREST);
+            gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            gl.glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, w, h, 0, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, shadow.data());
+        }
+        if (layer.shadow[1].data() != shadow.data()) layer.shadow[1] = shadow;
+        return;
+    }
+
+    gl.glActiveTexture(GL_TEXTURE0);
+    gl.glBindTexture(GL_TEXTURE_2D, tex);
+    if (layer.linear != linear) {
+        for (int i = 0; i < 2; ++i) {
+            gl.glBindTexture(GL_TEXTURE_2D, layer.tex[i]);
+            gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, linear ? GL_LINEAR : GL_NEAREST);
+            gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, linear ? GL_LINEAR : GL_NEAREST);
+        }
         gl.glBindTexture(GL_TEXTURE_2D, tex);
-        gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, linear ? GL_LINEAR : GL_NEAREST);
-        gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, linear ? GL_LINEAR : GL_NEAREST);
-        gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        gl.glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, w, h, 0, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, shadow.data());
-        cur_w = w;
-        cur_h = h;
-    } else if (y_max > y_min) {
-        gl.glActiveTexture(GL_TEXTURE0);
-        gl.glBindTexture(GL_TEXTURE_2D, tex);
-        gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, linear ? GL_LINEAR : GL_NEAREST);
-        gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, linear ? GL_LINEAR : GL_NEAREST);
-        gl.glTexSubImage2D(GL_TEXTURE_2D, 0, 0, y_min, w, y_max - y_min, GL_RGB, GL_UNSIGNED_SHORT_5_6_5,
-                           shadow.data() + size_t(y_min) * size_t(w));
+        layer.linear = linear;
+    }
+
+    int y = 0;
+    while (y < h) {
+        while (y < h && !row_dirty[y]) ++y;
+        if (y >= h) break;
+        const int y0 = y;
+        int y1 = y + 1;
+        while (y1 < h) {
+            if (row_dirty[y1]) { ++y1; continue; }
+            int gap = 0;
+            while (y1 + gap < h && !row_dirty[y1 + gap] && gap < 8) ++gap;
+            if (y1 + gap < h && row_dirty[y1 + gap]) { y1 += gap + 1; continue; }
+            break;
+        }
+        gl.glTexSubImage2D(GL_TEXTURE_2D, 0, 0, y0, w, y1 - y0, GL_RGB, GL_UNSIGNED_SHORT_5_6_5,
+                           shadow.data() + size_t(y0) * size_t(w));
+        y = y1;
     }
 }
 
-void GpuGlesRenderer::update_texture_2d_rgba5551(uint32_t &tex, int &cur_w, int &cur_h, int w, int h, bool linear,
-                                                 const uint32_t *argb, size_t stride_px, std::vector<uint16_t> &shadow) {
+void GpuGlesRenderer::update_texture_2d_rgba5551(LayerTex2D &layer, int w, int h, bool linear,
+                                                 const uint32_t *argb, size_t stride_px,
+                                                 int y_active0, int y_active1, int &prev_y0, int &prev_y1) {
     if (w <= 0 || h <= 0 || !argb) return;
+    auto &gl = g.gl;
     const size_t total = size_t(w) * size_t(h);
-    const bool realloc_tex = (!tex || cur_w != w || cur_h != h || shadow.size() != total);
-    if (realloc_tex) shadow.resize(total);
-    int y_min = h, y_max = -1;
-    for (int y = 0; y < h; ++y) {
+    const bool realloc_tex = (!layer.tex[0] || !layer.tex[1] || layer.w != w || layer.h != h ||
+                              layer.shadow[0].size() != total || layer.shadow[1].size() != total);
+    if (realloc_tex) {
+        for (int i = 0; i < 2; ++i) {
+            if (layer.tex[i] && g.ready) { GLuint t = layer.tex[i]; gl.glDeleteTextures(1, &t); layer.tex[i] = 0; }
+            layer.shadow[i].assign(total, 0u);
+        }
+        layer.w = w;
+        layer.h = h;
+        layer.linear = linear;
+        layer.cur = 0;
+        prev_y0 = 0;
+        prev_y1 = h;
+    } else {
+        layer.cur ^= 1u;
+    }
+
+    uint32_t &tex = layer.tex[layer.cur];
+    std::vector<uint16_t> &shadow = layer.shadow[layer.cur];
+
+    const int scan_y0 = realloc_tex ? 0 : std::clamp(std::min(y_active0, prev_y0), 0, h);
+    const int scan_y1 = realloc_tex ? h : std::clamp(std::max(y_active1, prev_y1), 0, h);
+    prev_y0 = std::clamp(y_active0, 0, h);
+    prev_y1 = std::clamp(y_active1, 0, h);
+
+    uint8_t row_dirty[512] = {};
+    for (int y = scan_y0; y < scan_y1; ++y) {
         const uint32_t *src = argb + size_t(y) * stride_px;
         uint16_t *dst = shadow.data() + size_t(y) * size_t(w);
-        bool row_dirty = realloc_tex;
-        for (int x = 0; x < w; ++x) {
+        uint32_t diff_acc = realloc_tex ? 1u : 0u;
+        int x = 0;
+#if defined(__aarch64__)
+        uint16x8_t vdiff = vdupq_n_u16(0);
+        const uint32x4_t vzero32 = vdupq_n_u32(0);
+        for (; x + 8 <= w; x += 8) {
+            const uint32x4_t c0 = vld1q_u32(src + x);
+            const uint32x4_t c1 = vld1q_u32(src + x + 4);
+            const uint16x4_t m0 = vmovn_u32(vcgtq_u32(c0, vzero32));
+            const uint16x4_t m1 = vmovn_u32(vcgtq_u32(c1, vzero32));
+            const uint16x4_t rgb0 = vorr_u16(
+                vorr_u16(vand_u16(vshrn_n_u32(c0, 8), vdup_n_u16(0xf800u)),
+                         vand_u16(vshrn_n_u32(c0, 5), vdup_n_u16(0x07c0u))),
+                vorr_u16(vand_u16(vshrn_n_u32(c0, 2), vdup_n_u16(0x003eu)), vdup_n_u16(1u)));
+            const uint16x4_t rgb1 = vorr_u16(
+                vorr_u16(vand_u16(vshrn_n_u32(c1, 8), vdup_n_u16(0xf800u)),
+                         vand_u16(vshrn_n_u32(c1, 5), vdup_n_u16(0x07c0u))),
+                vorr_u16(vand_u16(vshrn_n_u32(c1, 2), vdup_n_u16(0x003eu)), vdup_n_u16(1u)));
+            const uint16x8_t p = vcombine_u16(vand_u16(rgb0, m0), vand_u16(rgb1, m1));
+            const uint16x8_t old = vld1q_u16(dst + x);
+            vdiff = vorrq_u16(vdiff, veorq_u16(old, p));
+            vst1q_u16(dst + x, p);
+        }
+        diff_acc |= vmaxvq_u16(vdiff);
+#endif
+        for (; x < w; ++x) {
             const uint32_t c = src[x];
             const uint16_t p = (c >> 24)
                 ? uint16_t((((c >> 19) & 0x1fu) << 11) | (((c >> 11) & 0x1fu) << 6) | (((c >> 3) & 0x1fu) << 1) | 1u)
                 : 0u;
-            if (dst[x] != p) {
-                dst[x] = p;
-                row_dirty = true;
-            }
+            diff_acc |= uint32_t(dst[x] ^ p);
+            dst[x] = p;
         }
-        if (row_dirty) {
-            if (y < y_min) y_min = y;
-            y_max = y + 1;
-        }
+        if (diff_acc && y < 512) row_dirty[y] = 1;
     }
-    auto &gl = g.gl;
+
     if (realloc_tex) {
-        if (tex && g.ready) { GLuint t = tex; gl.glDeleteTextures(1, &t); }
-        GLuint t = 0;
-        gl.glGenTextures(1, &t);
-        tex = t;
-        if (!tex) return;
-        gl.glActiveTexture(GL_TEXTURE0);
-        gl.glBindTexture(GL_TEXTURE_2D, tex);
-        gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, linear ? GL_LINEAR : GL_NEAREST);
-        gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, linear ? GL_LINEAR : GL_NEAREST);
-        gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        gl.glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_SHORT_5_5_5_1, shadow.data());
-        cur_w = w;
-        cur_h = h;
-    } else if (y_max > y_min) {
-        gl.glActiveTexture(GL_TEXTURE0);
-        gl.glBindTexture(GL_TEXTURE_2D, tex);
-        gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, linear ? GL_LINEAR : GL_NEAREST);
-        gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, linear ? GL_LINEAR : GL_NEAREST);
-        gl.glTexSubImage2D(GL_TEXTURE_2D, 0, 0, y_min, w, y_max - y_min, GL_RGBA, GL_UNSIGNED_SHORT_5_5_5_1,
-                           shadow.data() + size_t(y_min) * size_t(w));
+        for (int i = 0; i < 2; ++i) {
+            GLuint t = 0;
+            gl.glGenTextures(1, &t);
+            layer.tex[i] = t;
+            if (!t) continue;
+            gl.glActiveTexture(GL_TEXTURE0);
+            gl.glBindTexture(GL_TEXTURE_2D, t);
+            gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, linear ? GL_LINEAR : GL_NEAREST);
+            gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, linear ? GL_LINEAR : GL_NEAREST);
+            gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            gl.glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_SHORT_5_5_5_1, shadow.data());
+        }
+        if (layer.shadow[1].data() != shadow.data()) layer.shadow[1] = shadow;
+        return;
+    }
+
+    gl.glActiveTexture(GL_TEXTURE0);
+    gl.glBindTexture(GL_TEXTURE_2D, tex);
+    int y = scan_y0;
+    while (y < scan_y1) {
+        while (y < scan_y1 && !row_dirty[y]) ++y;
+        if (y >= scan_y1) break;
+        const int y0 = y;
+        int y1 = y + 1;
+        while (y1 < scan_y1) {
+            if (row_dirty[y1]) { ++y1; continue; }
+            int gap = 0;
+            while (y1 + gap < scan_y1 && !row_dirty[y1 + gap] && gap < 8) ++gap;
+            if (y1 + gap < scan_y1 && row_dirty[y1 + gap]) { y1 += gap + 1; continue; }
+            break;
+        }
+        gl.glTexSubImage2D(GL_TEXTURE_2D, 0, 0, y0, w, y1 - y0, GL_RGBA, GL_UNSIGNED_SHORT_5_5_5_1,
+                           shadow.data() + size_t(y0) * size_t(w));
+        y = y1;
     }
 }
 
@@ -813,6 +982,16 @@ void GpuGlesRenderer::clear_tex_cache() {
     }
     sources_.clear();
     cached_bytes_ = 0;
+    last_tex_clears_++;
+}
+
+void GpuGlesRenderer::clear_tex_sheet(uint32_t sheet) {
+    const uint64_t s = sheet & 1u;
+    for (auto &entry : sources_) {
+        if ((entry.first.val & 1u) == s) {
+            entry.second.stale = true;
+        }
+    }
     last_tex_clears_++;
 }
 
@@ -828,6 +1007,7 @@ void GpuGlesRenderer::reset_caches() {
     clear_tex_cache();
     clear_pal_cache();
     last_2d_version_ = UINT64_MAX;
+    last_sides_version_ = UINT64_MAX;
     last_tex_gen_[0] = last_tex_gen_[1] = UINT32_MAX;
     last_luma_gen_ = last_xlat_gen_ = UINT32_MAX;
     have_gamma_ = false;
@@ -841,10 +1021,15 @@ void GpuGlesRenderer::shutdown() {
         if (t && g.ready) { GLuint tt = t; g.gl.glDeleteTextures(1, &tt); }
         t = 0;
     };
+    auto del_layer = [&](LayerTex2D &l) {
+        del(l.tex[0]);
+        del(l.tex[1]);
+        l.w = l.h = 0;
+    };
     del(palette_texture_);
-    del(tex_bd_);
-    del(tex_mid_);
-    del(tex_top_);
+    del_layer(layer_bd_);
+    del_layer(layer_mid_);
+    del_layer(layer_top_);
     del(tex_cpu3d_);
     del(tex_sides_);
     g.palette_texture = 0;
@@ -868,13 +1053,23 @@ const GpuGlesRenderer::TexSource *GpuGlesRenderer::source_for(const gpu3d_poly &
         (uint64_t(poly.mirrorx & 1) << 47) |
         (uint64_t(poly.mirrory & 1) << 48);
     const TexKey key{key_val};
-    auto found = sources_.find(key);
-    if (found != sources_.end()) return &found->second;
-
-    if (cached_bytes_ >= kSourceCacheBytes) clear_tex_cache();
-
     const uint32_t *sheet = poly.sheet ? rams.tex[1] : rams.tex[0];
     if (!sheet) return nullptr;
+
+    auto found = sources_.find(key);
+    uint64_t rect_hash = 0;
+    bool have_hash = false;
+    if (found != sources_.end()) {
+        if (!found->second.stale) return &found->second;
+        rect_hash = hash_tex_rect(poly.texx, poly.texy, w, h, sheet);
+        have_hash = true;
+        if (rect_hash == found->second.hash) {
+            found->second.stale = false;
+            return &found->second;
+        }
+    }
+
+    if (found == sources_.end() && cached_bytes_ >= kSourceCacheBytes) clear_tex_cache();
 
     const uint32_t step_x = std::max(1u, (w + kTextureLimit - 1) / kTextureLimit);
     const uint32_t step_y = std::max(1u, (h + kTextureLimit - 1) / kTextureLimit);
@@ -911,12 +1106,24 @@ const GpuGlesRenderer::TexSource *GpuGlesRenderer::source_for(const gpu3d_poly &
             }
         }
     }
-    const uint32_t wrap_s = poly.mirrorx ? GL_MIRRORED_REPEAT : (poly.wrapx ? GL_REPEAT : GL_CLAMP_TO_EDGE);
-    const uint32_t wrap_t = poly.mirrory ? GL_MIRRORED_REPEAT : (poly.wrapy ? GL_REPEAT : GL_CLAMP_TO_EDGE);
+    if (!have_hash) rect_hash = hash_tex_rect(poly.texx, poly.texy, w, h, sheet);
+    if (found != sources_.end()) {
+        auto &gl = g.gl;
+        gl.glActiveTexture(GL_TEXTURE0);
+        gl.glBindTexture(GL_TEXTURE_2D, found->second.texture);
+        gl.glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, GLsizei(tw), GLsizei(th), GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, la);
+        found->second.hash = rect_hash;
+        found->second.stale = false;
+        return &found->second;
+    }
+    const uint32_t wrap_s = poly.mirrorx ? GL_MIRRORED_REPEAT : GL_REPEAT;
+    const uint32_t wrap_t = poly.mirrory ? GL_MIRRORED_REPEAT : GL_REPEAT;
     TexSource s;
     s.w = w;
     s.h = h;
     s.transparent = trans;
+    s.stale = false;
+    s.hash = rect_hash;
     s.texture = make_texture(tw, th, true, wrap_s, wrap_t, GL_LUMINANCE_ALPHA, la);
     if (!s.texture) return nullptr;
     s.bytes = index_scratch_.size();
@@ -934,16 +1141,16 @@ int GpuGlesRenderer::palette_row(const gpu3d_poly &poly, const gpu3d_rams &rams)
     if (palette_used_ >= kPaletteRows) clear_pal_cache();
 
     const uint32_t row = palette_used_++;
-    uint32_t *out = &palette_shadow_[size_t(row) * kPaletteWidth];
+    uint16_t *out = &palette_shadow_[size_t(row) * kPaletteWidth];
     const uint16_t *xr = &rams.xlat[0x0000 / 2 + (((pal >> 0) & 0x1f) << 8)];
     const uint16_t *xg = &rams.xlat[0x4000 / 2 + (((pal >> 5) & 0x1f) << 8)];
     const uint16_t *xb = &rams.xlat[0x8000 / 2 + (((pal >> 10) & 0x1f) << 8)];
     for (uint32_t k = 0; k < kPaletteWidth; ++k) {
-        const uint32_t luma = std::min(uint32_t(rams.luma[(lumabase + k) & 0x7fffu]) * luma_scale / 256u, 0x3fu);
+        const uint32_t luma = std::min((uint32_t(rams.luma[(lumabase + k) & 0x7fffu]) * luma_scale) >> 8, 0x3fu);
         const uint8_t r = rams.gamma[xr[luma] & 0xff];
         const uint8_t gg = rams.gamma[xg[luma] & 0xff];
         const uint8_t b = rams.gamma[xb[luma] & 0xff];
-        out[k] = RGBA8(r, gg, b, 255);
+        out[k] = pack_rgb565(r, gg, b);
     }
     palette_index_[key] = row;
     palette_dirty_begin_ = std::min(palette_dirty_begin_, row);
@@ -957,7 +1164,7 @@ void GpuGlesRenderer::flush_palette_gl() {
     gl.glActiveTexture(GL_TEXTURE1);
     gl.glBindTexture(GL_TEXTURE_2D, palette_texture_);
     gl.glTexSubImage2D(GL_TEXTURE_2D, 0, 0, GLint(palette_dirty_begin_), GLsizei(kPaletteWidth),
-                       GLsizei(palette_dirty_end_ - palette_dirty_begin_), GL_RGBA, GL_UNSIGNED_BYTE,
+                       GLsizei(palette_dirty_end_ - palette_dirty_begin_), GL_RGB, GL_UNSIGNED_SHORT_5_6_5,
                        &palette_shadow_[size_t(palette_dirty_begin_) * kPaletteWidth]);
     gl.glActiveTexture(GL_TEXTURE0);
     palette_dirty_begin_ = UINT32_MAX;
@@ -971,7 +1178,13 @@ void GpuGlesRenderer::emit_3d_polys(const gpu3d_poly *polys, size_t count, const
     if (!count || !polys) return;
 
     if (rams.gen[0] != last_tex_gen_[0] || rams.gen[1] != last_tex_gen_[1]) {
-        clear_tex_cache();
+        const bool ch0 = rams.gen[0] != last_tex_gen_[0];
+        const bool ch1 = rams.gen[1] != last_tex_gen_[1];
+        if (last_tex_gen_[0] == UINT32_MAX) clear_tex_cache();
+        else {
+            if (ch0) clear_tex_sheet(0);
+            if (ch1) clear_tex_sheet(1);
+        }
         last_tex_gen_[0] = rams.gen[0];
         last_tex_gen_[1] = rams.gen[1];
     }
@@ -987,7 +1200,10 @@ void GpuGlesRenderer::emit_3d_polys(const gpu3d_poly *polys, size_t count, const
     }
 
     g.batch_count = 0;
-    g.batch_index.clear();
+    if (++g.batch_gen == 0) {
+        std::memset(g.batch_hash, 0, sizeof(g.batch_hash));
+        g.batch_gen = 1;
+    }
 
     const float depth_step = 0.9998f / float(count + 2);
     for (size_t i = 0; i < count; ++i) {
@@ -1010,7 +1226,7 @@ void GpuGlesRenderer::emit_3d_polys(const gpu3d_poly *polys, size_t count, const
         const float depth = 0.9999f - float(i + 1) * depth_step;
         if (!(p.renderer & 2)) {
             const Prog prog = p.checker ? Prog::FlatChecker : Prog::Flat;
-            const uint32_t bi = batch_for(clip, prog, 0);
+            const uint32_t bi = batch_for(clip, prog, 0, depth);
             g.batches[bi].poly_refs.push_back({&p, depth, argb_to_rgba(p.colour), 0.0f, 1, 1});
             continue;
         }
@@ -1022,7 +1238,7 @@ void GpuGlesRenderer::emit_3d_polys(const gpu3d_poly *polys, size_t count, const
         const float pal_coord = (float(prow) + 0.5f) / float(kPaletteRows);
         const Prog prog = p.checker ? Prog::ModelChecker
                                     : (src->transparent ? Prog::ModelAlpha : Prog::Model);
-        const uint32_t bi = batch_for(clip, prog, src->texture);
+        const uint32_t bi = batch_for(clip, prog, src->texture, depth);
         g.batches[bi].poly_refs.push_back({&p, depth, 0xffffffffu, pal_coord, src->w, src->h});
     }
 
@@ -1096,16 +1312,22 @@ void GpuGlesRenderer::draw_frame(const model2a::picture_parts &parts, int w2d, A
     if (parts.version != last_2d_version_) {
         last_2d_version_ = parts.version;
         if (parts.backdrop) {
-            update_texture_2d_rgb565(tex_bd_, bd_w_, bd_h_, w + 2 * pad, 384 + 2 * pad, parts.filter,
-                                     parts.backdrop, size_t(w + 2 * pad), bd_shadow_);
+            update_texture_2d_rgb565(layer_bd_, w + 2 * pad, 384 + 2 * pad, parts.filter,
+                                     parts.backdrop, size_t(w + 2 * pad));
         }
-        mid_empty_ = !parts.mid || buffer_all_zero(parts.mid, w, 384);
+        draw_mid_y0_ = std::clamp(parts.mid_y0, 0, 384);
+        draw_mid_y1_ = std::clamp(parts.mid_y1, 0, 384);
+        mid_empty_ = !parts.mid || draw_mid_y1_ <= draw_mid_y0_;
         if (!mid_empty_) {
-            update_texture_2d_rgba5551(tex_mid_, mid_w_, mid_h_, w, 384, false, parts.mid, size_t(w), mid_shadow_);
+            update_texture_2d_rgba5551(layer_mid_, w, 384, false, parts.mid, size_t(w),
+                                       draw_mid_y0_, draw_mid_y1_, prev_mid_y0_, prev_mid_y1_);
         }
-        top_empty_ = !parts.top || buffer_all_zero(parts.top, w, 384);
+        draw_top_y0_ = std::clamp(parts.top_y0, 0, 384);
+        draw_top_y1_ = std::clamp(parts.top_y1, 0, 384);
+        top_empty_ = !parts.top || draw_top_y1_ <= draw_top_y0_;
         if (!top_empty_) {
-            update_texture_2d_rgba5551(tex_top_, top_w_, top_h_, w, 384, false, parts.top, size_t(w), top_shadow_);
+            update_texture_2d_rgba5551(layer_top_, w, 384, false, parts.top, size_t(w),
+                                       draw_top_y0_, draw_top_y1_, prev_top_y0_, prev_top_y1_);
         }
     }
 
@@ -1116,22 +1338,26 @@ void GpuGlesRenderer::draw_frame(const model2a::picture_parts &parts, int w2d, A
     const int screen_clip = add_clip({vx0, vy0, vx1, vy1});
 
     // 1. Backdrop
-    if (tex_bd_) {
+    if (const uint32_t tex_bd = layer_bd_.active()) {
         const float s = float(std::max(parts.s, 1));
         const float bx0 = ox + (-float(pad) - float(parts.bdx) / s) * sx;
         const float by0 = oy + (-float(pad) - float(parts.bdy) / s) * sy;
         const float bx1 = bx0 + float(w + 2 * pad) * sx;
         const float by1 = by0 + float(384 + 2 * pad) * sy;
         g.clip = screen_clip;
-        push_quad(Prog::Ui, tex_bd_, bx0, by0, bx1, by1, 0, 0, 1, 1, 0xffffffffu, Depth::Off, false);
+        push_quad(Prog::Ui, tex_bd, bx0, by0, bx1, by1, 0, 0, 1, 1, 0xffffffffu, Depth::Off, false);
         g.clip = -1;
     }
 
-    // 2. Mid 2D
-    if (!mid_empty_ && tex_mid_) {
+    // 2. Mid 2D (only active row band [draw_mid_y0_, draw_mid_y1_))
+    if (!mid_empty_ && layer_mid_.active() && draw_mid_y1_ > draw_mid_y0_) {
+        const float v0 = float(draw_mid_y0_) * (1.0f / 384.0f);
+        const float v1 = float(draw_mid_y1_) * (1.0f / 384.0f);
         g.clip = screen_clip;
-        push_quad(Prog::Ui, tex_mid_, ox, oy, ox + float(w) * sx, oy + 384.0f * sy,
-                  0, 0, 1, 1, 0xffffffffu, Depth::Off, true);
+        push_quad(Prog::Ui, layer_mid_.active(),
+                  ox, oy + float(draw_mid_y0_) * sy,
+                  ox + float(w) * sx, oy + float(draw_mid_y1_) * sy,
+                  0.0f, v0, 1.0f, v1, 0xffffffffu, Depth::Off, true);
         g.clip = -1;
     }
 
@@ -1152,11 +1378,49 @@ void GpuGlesRenderer::draw_frame(const model2a::picture_parts &parts, int w2d, A
         last_batch_count_ = 0;
     }
 
-    // 4. Top 2D (HUD)
-    if (!top_empty_ && tex_top_) {
+    // 4. Top 2D (HUD): emit non-empty sub-bands so Mali-G31 skips blending transparent center rows
+    if (!top_empty_ && layer_top_.active() && draw_top_y1_ > draw_top_y0_) {
         g.clip = screen_clip;
-        push_quad(Prog::Ui, tex_top_, ox, oy, ox + float(w) * sx, oy + 384.0f * sy,
-                  0, 0, 1, 1, 0xffffffffu, Depth::Off, true);
+        const std::vector<uint16_t> &sh = layer_top_.shadow[layer_top_.cur];
+        // Find if there is a large empty gap (>= 64 rows) in the middle of the screen (e.g. between top lifebars and bottom credits)
+        int gap_y0 = -1, gap_y1 = -1;
+        if (draw_top_y1_ - draw_top_y0_ > 96 && sh.size() == size_t(w) * 384u) {
+            int cur_g0 = -1;
+            int best_len = 0;
+            for (int y = draw_top_y0_; y < draw_top_y1_; ++y) {
+                const uint64_t *row64 = reinterpret_cast<const uint64_t *>(sh.data() + size_t(y) * size_t(w));
+                uint64_t acc = 0;
+                const int n64 = w / 4;
+                for (int i = 0; i < n64; ++i) { acc |= row64[i]; if (acc) break; }
+                if (acc == 0) {
+                    if (cur_g0 < 0) cur_g0 = y;
+                } else if (cur_g0 >= 0) {
+                    if (y - cur_g0 > best_len) { best_len = y - cur_g0; gap_y0 = cur_g0; gap_y1 = y; }
+                    cur_g0 = -1;
+                }
+            }
+            if (cur_g0 >= 0 && draw_top_y1_ - cur_g0 > best_len) {
+                best_len = draw_top_y1_ - cur_g0;
+                gap_y0 = cur_g0;
+                gap_y1 = draw_top_y1_;
+            }
+            if (best_len < 64) gap_y0 = gap_y1 = -1;
+        }
+        auto emit_top_band = [&](int y0, int y1) {
+            if (y1 <= y0) return;
+            const float v0 = float(y0) * (1.0f / 384.0f);
+            const float v1 = float(y1) * (1.0f / 384.0f);
+            push_quad(Prog::Ui, layer_top_.active(),
+                      ox, oy + float(y0) * sy,
+                      ox + float(w) * sx, oy + float(y1) * sy,
+                      0.0f, v0, 1.0f, v1, 0xffffffffu, Depth::Off, true);
+        };
+        if (gap_y0 >= 0) {
+            emit_top_band(draw_top_y0_, gap_y0);
+            emit_top_band(gap_y1, draw_top_y1_);
+        } else {
+            emit_top_band(draw_top_y0_, draw_top_y1_);
+        }
         g.clip = -1;
     }
 
@@ -1172,8 +1436,11 @@ void GpuGlesRenderer::draw_frame(const model2a::picture_parts &parts, int w2d, A
     } else if (side_w > 0 && parts.sides == 2 && parts.side_px) {
         const int s = std::max(parts.s, 1);
         const int sw_px = side_w * s;
-        update_texture_rgba(tex_sides_, sides_w_, sides_h_, 2 * sw_px, 384 * s, false,
-                            parts.side_px, size_t(2 * sw_px));
+        if (parts.version != last_sides_version_ || !tex_sides_ || sides_w_ != 2 * sw_px || sides_h_ != 384 * s) {
+            last_sides_version_ = parts.version;
+            update_texture_rgba(tex_sides_, sides_w_, sides_h_, 2 * sw_px, 384 * s, false,
+                                parts.side_px, size_t(2 * sw_px));
+        }
         if (tex_sides_) {
             const float lw = float(side_w) * sx;
             const float rx = ox + float(w - side_w) * sx;
@@ -1194,6 +1461,24 @@ void GpuGlesRenderer::draw_cpu_framebuffer(const uint32_t *argb, int w, int h, A
         push_quad(Prog::Ui, tex_cpu3d_, ox, oy, ox + float(w) * sx, oy + float(h) * sy,
                   0, 0, 1, 1, 0xffffffffu, Depth::Off, false);
     }
+}
+
+inline uint64_t hash_tex_rect(uint32_t base_x, uint32_t base_y, uint32_t w, uint32_t h, const uint32_t *sheet) {
+    uint64_t hval = 0xcbf29ce484222325ull;
+    for (uint32_t y = 0; y < h; y += 2) {
+        const uint32_t ry = base_y + y;
+        for (uint32_t x = 0; x < w; x += 4) {
+            uint32_t x2 = base_x + x;
+            uint32_t y2 = ry;
+            const uint32_t right = x2 >= 1024 ? 1024u : 0u;
+            x2 -= right;
+            y2 ^= right;
+            const uint32_t offset = ((y2 >> 1) << 9) + (x2 >> 1);
+            hval ^= sheet[offset >> 1];
+            hval *= 0x100000001b3ull;
+        }
+    }
+    return hval;
 }
 
 } // namespace arm64

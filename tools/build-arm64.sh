@@ -156,10 +156,10 @@ if [ ! -f "$BDIR/libz.a" ]; then
 fi
 
 # 4b. SLJIT (ARM64 native code generator)
-"$ZIG_BIN" cc -target "$TARGET_TRIPLE" -mcpu="$TARGET_CPU" -O2 -w -DSLJIT_CONFIG_AUTO=1 \
+"$ZIG_BIN" cc -target "$TARGET_TRIPLE" -mcpu="$TARGET_CPU" -O3 -w -DSLJIT_CONFIG_AUTO=1 \
     -c third_party/sljit/sljitLir.c -o "$BDIR/sljitLir.o"
 
-CXX_FLAGS="-target $TARGET_TRIPLE -mcpu=$TARGET_CPU -std=c++20 -O2 -fno-fast-math -ffp-contract=off \
+CXX_FLAGS="-target $TARGET_TRIPLE -mcpu=$TARGET_CPU -std=c++20 -O3 -fno-fast-math -fno-math-errno -ffp-contract=off \
   -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare -Wno-unused-but-set-variable -Wno-unused-variable -Wno-unused-function -Wno-attributes \
   -Isrc/core/shim_include -Isrc -Iplatform/arm64 -I$ZLIB_DIR -I$EXTERN/imgui -I$SDL_INC -I$SDL_INC/SDL2"
 
@@ -181,9 +181,9 @@ printf '%s\n' "${RT_SRCS[@]}" | xargs -P "$JOBS" -I{} sh -c '
     out="$2/${tag}.o"
     extra=""
     case "$src" in
-        third_party/mame/m68000/*) extra="-w -O3 -fno-math-errno" ;;
-        third_party/*|src/host/stb_image_impl.cpp) extra="-w" ;;
-        src/machine/scsp.cpp|src/machine/scspdsp.cpp|src/machine/model2_video.cpp|src/machine/model2_smooth.cpp) extra="-O3 -fno-math-errno" ;;
+        third_party/mame/m68000/*|third_party/*|src/host/stb_image_impl.cpp) extra="-w -O3 -fno-math-errno" ;;
+        src/machine/model2_video.cpp|src/machine/model2_smooth.cpp) extra="-O3 -fno-math-errno -ffp-contract=fast" ;;
+        *) extra="-O3 -fno-math-errno" ;;
     esac
     exec "$3" c++ '"$CXX_FLAGS"' $extra -c "$src" -o "$out"
 ' _ {} "$BDIR/rt" "$ZIG_BIN"
@@ -210,7 +210,7 @@ APP_SRCS=(platform/arm64/gpu_gles.cpp platform/arm64/main_arm64.cpp)
 printf '%s\n' "${APP_SRCS[@]}" | xargs -P "$JOBS" -I{} sh -c '
     src="$1"
     out="$2/$(basename "$src" .cpp).o"
-    exec "$3" c++ '"$CXX_FLAGS"' -O3 -fno-math-errno -c "$src" -o "$out"
+    exec "$3" c++ '"$CXX_FLAGS"' -O3 -fno-math-errno -ffp-contract=fast -c "$src" -o "$out"
 ' _ {} "$BDIR/obj" "$ZIG_BIN"
 
 # 5. Link vf2.aarch64 against link-time SDL2 stub + static libz.a + static libimgui.a

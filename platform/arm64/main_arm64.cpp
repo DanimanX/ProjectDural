@@ -42,6 +42,7 @@
 namespace {
 
 constexpr int kMainCore = 0;
+constexpr int kEmuCore = 1;
 constexpr int kSoundCore = 2;
 
 uint64_t ticks_us() {
@@ -49,6 +50,108 @@ uint64_t ticks_us() {
     ::clock_gettime(CLOCK_MONOTONIC, &ts);
     return uint64_t(ts.tv_sec) * 1000000ull + uint64_t(ts.tv_nsec) / 1000ull;
 }
+
+class EmuWorker {
+public:
+    EmuWorker() = default;
+    ~EmuWorker() { close(); }
+
+    void open(model2a *game, int core) {
+        close();
+        game_ = game;
+        core_ = core;
+        stop_ = false;
+        busy_ = false;
+        render_busy_ = false;
+        game_->set_ext_render_wait([this]() { wait_render_done(); });
+        thread_ = std::thread(&EmuWorker::loop, this);
+    }
+
+    void close() {
+        if (thread_.joinable()) {
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                stop_ = true;
+                render_busy_ = false;
+            }
+            cv_.notify_all();
+            render_cv_.notify_all();
+            thread_.join();
+        }
+        if (game_) {
+            game_->set_ext_render_wait({});
+            game_ = nullptr;
+        }
+    }
+
+    void start_frame(bool render_in_progress) {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            render_busy_ = render_in_progress;
+            busy_ = true;
+        }
+        cv_.notify_one();
+    }
+
+    void mark_render_done() {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (!render_busy_) return;
+            render_busy_ = false;
+        }
+        render_cv_.notify_all();
+    }
+
+    void wait_frame() {
+        if (!thread_.joinable()) return;
+        std::unique_lock<std::mutex> lk(mu_);
+        done_.wait(lk, [&] { return !busy_; });
+    }
+
+    bool is_busy() {
+        std::lock_guard<std::mutex> lk(mu_);
+        return busy_;
+    }
+
+    double last_emu_ms() const { return last_emu_ms_.load(std::memory_order_relaxed); }
+
+private:
+    void wait_render_done() {
+        std::unique_lock<std::mutex> lk(mu_);
+        render_cv_.wait(lk, [&] { return !render_busy_ || stop_; });
+    }
+
+    void loop() {
+        arm64::pin_current_thread(core_);
+        arm64::set_current_thread_name("dural-emu");
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lk(mu_);
+                cv_.wait(lk, [&] { return stop_ || busy_; });
+                if (stop_) return;
+            }
+            const uint64_t t0 = ticks_us();
+            game_->run_frame();
+            const double ms = double(ticks_us() - t0) / 1000.0;
+            last_emu_ms_.store(ms, std::memory_order_relaxed);
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                busy_ = false;
+            }
+            done_.notify_all();
+        }
+    }
+
+    model2a *game_ = nullptr;
+    int core_ = 1;
+    std::thread thread_;
+    std::mutex mu_;
+    std::condition_variable cv_, done_, render_cv_;
+    bool stop_ = false;
+    bool busy_ = false;
+    bool render_busy_ = false;
+    std::atomic<double> last_emu_ms_{0.0};
+};
 
 void ensure_dir(const std::string &path) {
     if (path.empty()) return;
@@ -411,6 +514,9 @@ int main(int argc, char **argv) {
     arm64::pin_current_thread(kMainCore);
     arm64::set_current_thread_name("dural-main");
     setenv("VF2_THREADS", "2", 0);
+#if defined(__aarch64__)
+    setenv("VF2_WORKER_CORE", "3", 0);
+#endif
 
     if (cli.bench_synthetic > 0) return run_synthetic_bench(cli.bench_synthetic);
 
@@ -528,8 +634,12 @@ int main(int argc, char **argv) {
     load_backgrounds(*game, data_dir + "/assets/backgrounds");
     load_nvram(*game, data_dir + "/saves");
 
+    EmuWorker emu_worker;
+
     auto restart_game = [&](bool skip_boot) {
-        sound_worker.wait();
+        emu_worker.mark_render_done();
+        emu_worker.wait_frame();
+        sound_worker.set_paused(true);
         sound_worker.reset();
         game->forget_boot();
         if (cfg.free_play) {
@@ -559,9 +669,11 @@ int main(int argc, char **argv) {
             }
             sound_worker.wait();
         }
+        sound_worker.set_paused(false);
     };
 
     restart_game(true);
+    emu_worker.open(game.get(), kEmuCore);
 
     enum class MenuPage { Main, Display, Audio, Arcade, Cheats, Controls };
     bool running = true;
@@ -589,8 +701,8 @@ int main(int argc, char **argv) {
     int fps_frames = 0;
     int log_frames = 0;
     double current_fps = 57.524;
-    double last_emu_ms = 0.0, last_ren_ms = 0.0, last_swap_ms = 0.0;
-    double sum_emu_ms = 0.0, sum_snd_ms = 0.0, sum_ren_ms = 0.0, sum_swap_ms = 0.0;
+    double last_emu_ms = 0.0, last_parts_ms = 0.0, last_gles_ms = 0.0, last_swap_ms = 0.0;
+    double sum_emu_ms = 0.0, sum_snd_ms = 0.0, sum_parts_ms = 0.0, sum_gles_ms = 0.0, sum_swap_ms = 0.0;
     double sum_polys = 0.0, sum_batches = 0.0;
     uint32_t prev_tex_clr = gpu.last_tex_clears(), prev_pal_clr = gpu.last_pal_clears();
 
@@ -612,8 +724,15 @@ int main(int argc, char **argv) {
             menu_open = !menu_open;
             menu_page = MenuPage::Main;
             menu_idx = 0;
-            if (menu_open && audio_ok) audio.pause();
-            if (!menu_open) cfg.save(settings_path);
+            if (menu_open) {
+                emu_worker.mark_render_done();
+                emu_worker.wait_frame();
+                sound_worker.set_paused(true);
+                if (audio_ok) audio.pause();
+            } else {
+                sound_worker.set_paused(false);
+                cfg.save(settings_path);
+            }
             next_frame_us = ticks_us();
         }
         menu_latch = chord_now;
@@ -629,51 +748,73 @@ int main(int argc, char **argv) {
             }
             arm64::apply_player_buttons(p0_btns, cfg.bindings, false, in0, in1, sys_combo);
             arm64::apply_player_buttons(p1_btns, cfg.bindings, true, in0, in2, false);
-            game->m_in0 = in0;
-            game->m_in1 = in1;
-            game->m_in2 = in2;
-            game->m_sw = 0xff;
 
-            game->fight_cheats(cfg.cheat_inf_energy, cfg.cheat_one_hit, cfg.cheat_no_time, cfg.cheat_ring, cfg.cheat_bird);
+            // If first frame after boot/menu, kick off initial frame synchronously
+            if (!emu_worker.is_busy()) {
+                game->m_in0 = in0;
+                game->m_in1 = in1;
+                game->m_in2 = in2;
+                game->m_sw = 0xff;
+                game->fight_cheats(cfg.cheat_inf_energy, cfg.cheat_one_hit, cfg.cheat_no_time, cfg.cheat_ring, cfg.cheat_bird);
+                uart_bytes.clear();
+                emu_worker.start_frame(false);
+            }
 
-            const uint64_t t_emu0 = ticks_us();
-            uart_bytes.clear();
-            game->run_frame();
-            last_emu_ms = double(ticks_us() - t_emu0) / 1000.0;
+            // Wait for Core 1 to complete the current frame's CPU emulation
+            emu_worker.wait_frame();
+            last_emu_ms = emu_worker.last_emu_ms();
 
-            sound_worker.wait();
-            sound_worker.submit(std::move(uart_bytes));
+            if (!uart_bytes.empty()) {
+                sound_worker.push_uart(uart_bytes.data(), uart_bytes.size());
+                uart_bytes.clear();
+            }
 
             if (game->ranking_names_version() != prev_rank_ver) {
                 prev_rank_ver = game->ranking_names_version();
                 save_text(data_dir + "/saves/ranking_names.txt", game->ranking_names());
             }
 
-            // Render frame
+            // Snapshot 2D planes & 3D display list while Core 1 is idle
             const uint64_t t_ren0 = ticks_us();
-            arm64::gl_begin_frame();
             const arm64::AspectMode aspect_mode = static_cast<arm64::AspectMode>(cfg.aspect);
             model2a::picture_parts parts;
             const bool got_parts = game->render_parts(-1.0f, nullptr, 0, false, parts,
                                                       cfg.gpu_3d ? &gpu_hook : nullptr, false, false);
-            if (got_parts) {
-                gpu.draw_frame(parts, game->width(), aspect_mode,
-                               frame_polys.data(), frame_polys.size(), &frame_rams);
-            } else {
-                const int w = game->width();
-                cpu_fb.resize(size_t(w) * 384u);
-                game->render_into(cpu_fb.data(), size_t(w), true);
-                gpu.draw_cpu_framebuffer(cpu_fb.data(), w, 384, aspect_mode);
+            int fb_w = 0;
+            if (!got_parts) {
+                fb_w = game->width();
+                cpu_fb.resize(size_t(fb_w) * 384u);
+                game->render_into(cpu_fb.data(), size_t(fb_w), true);
             }
-            last_ren_ms = double(ticks_us() - t_ren0) / 1000.0;
+            const int game_w = game->width();
+            const uint64_t t_parts1 = ticks_us();
+            last_parts_ms = double(t_parts1 - t_ren0) / 1000.0;
+
+            // Immediately launch Core 1 on the NEXT frame's CPU emulation in parallel with Core 0 GLES + Swap!
+            game->m_in0 = in0;
+            game->m_in1 = in1;
+            game->m_in2 = in2;
+            game->m_sw = 0xff;
+            game->fight_cheats(cfg.cheat_inf_energy, cfg.cheat_one_hit, cfg.cheat_no_time, cfg.cheat_ring, cfg.cheat_bird);
+            emu_worker.start_frame(got_parts);
+
+            arm64::gl_begin_frame();
+            if (got_parts) {
+                gpu.draw_frame(parts, game_w, aspect_mode,
+                               frame_polys.data(), frame_polys.size(), &frame_rams);
+                emu_worker.mark_render_done();
+            } else {
+                gpu.draw_cpu_framebuffer(cpu_fb.data(), fb_w, 384, aspect_mode);
+            }
+            last_gles_ms = double(ticks_us() - t_parts1) / 1000.0;
 
             if (cfg.show_fps) {
                 imgui.frame(1.0f / 60.0f);
                 ImGui::SetNextWindowPos({8.0f, 8.0f}, ImGuiCond_Always);
                 ImGui::SetNextWindowBgAlpha(0.65f);
                 ImGui::Begin("##fps", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs);
-                ImGui::Text("FPS: %.1f | Emu:%.1f GPU:%.1f Swap:%.1f Snd:%.1f | P:%zu(%zu)",
-                            current_fps, last_emu_ms, last_ren_ms, last_swap_ms,
+                ImGui::Text("FPS: %.1f | Emu:%.1f 2D:%.1f GL:%.1f Swap:%.1f Snd:%.1f | P:%zu(%zu)",
+                            current_fps, last_emu_ms, last_parts_ms, last_gles_ms, last_swap_ms,
                             sound_worker.last_work_ms(), gpu.last_poly_count(), gpu.last_batch_count());
                 ImGui::End();
                 imgui.render();
@@ -687,7 +828,8 @@ int main(int argc, char **argv) {
             ++log_frames;
             sum_emu_ms += last_emu_ms;
             sum_snd_ms += sound_worker.last_work_ms();
-            sum_ren_ms += last_ren_ms;
+            sum_parts_ms += last_parts_ms;
+            sum_gles_ms += last_gles_ms;
             sum_swap_ms += last_swap_ms;
             sum_polys += double(gpu.last_poly_count());
             sum_batches += double(gpu.last_batch_count());
@@ -702,16 +844,16 @@ int main(int argc, char **argv) {
                 const uint32_t tc = gpu.last_tex_clears();
                 const uint32_t pc = gpu.last_pal_clears();
                 std::fprintf(stderr,
-                             "[perf] fps=%.1f emu=%.2fms snd=%.2fms gpu=%.2fms swap=%.2fms polys=%.0f batches=%.0f tex=%.1fMB tex_clr=%u pal_clr=%u\n",
-                             lf, sum_emu_ms / log_frames, sum_snd_ms / log_frames, sum_ren_ms / log_frames,
-                             sum_swap_ms / log_frames, sum_polys / log_frames, sum_batches / log_frames,
+                             "[perf] fps=%.1f emu=%.2fms snd=%.2fms 2d_exp=%.2fms gles=%.2fms swap=%.2fms polys=%.0f batches=%.0f tex=%.1fMB tex_clr=%u pal_clr=%u\n",
+                             lf, sum_emu_ms / log_frames, sum_snd_ms / log_frames, sum_parts_ms / log_frames,
+                             sum_gles_ms / log_frames, sum_swap_ms / log_frames, sum_polys / log_frames, sum_batches / log_frames,
                              double(gpu.cached_tex_bytes()) / (1024.0 * 1024.0),
                              tc - prev_tex_clr, pc - prev_pal_clr);
                 prev_tex_clr = tc;
                 prev_pal_clr = pc;
                 log_frames = 0;
                 log_t0 = now;
-                sum_emu_ms = sum_snd_ms = sum_ren_ms = sum_swap_ms = sum_polys = sum_batches = 0.0;
+                sum_emu_ms = sum_snd_ms = sum_parts_ms = sum_gles_ms = sum_swap_ms = sum_polys = sum_batches = 0.0;
             }
             if (!cfg.vsync) {
                 const uint64_t period_us = cfg.sync_60hz ? 16667ull : 17384ull;
@@ -731,7 +873,7 @@ int main(int argc, char **argv) {
             prev_p0_menu = p0_btns;
             auto go_back = [&]() {
                 if (menu_page != MenuPage::Main) { menu_page = MenuPage::Main; menu_idx = 0; }
-                else { menu_open = false; cfg.save(settings_path); next_frame_us = ticks_us(); }
+                else { menu_open = false; sound_worker.set_paused(false); cfg.save(settings_path); next_frame_us = ticks_us(); }
             };
             if (edge & arm64::BtnB) go_back();
 
@@ -770,7 +912,7 @@ int main(int argc, char **argv) {
 
             if (menu_page == MenuPage::Main) {
                 if (row(0, "Resume Game", nullptr) && (act || ImGui::IsItemClicked())) {
-                    menu_open = false; cfg.save(settings_path); next_frame_us = ticks_us();
+                    menu_open = false; sound_worker.set_paused(false); cfg.save(settings_path); next_frame_us = ticks_us();
                 }
                 if (row(1, "Display", "->") && (act || lr > 0 || ImGui::IsItemClicked())) { menu_page = MenuPage::Display; menu_idx = 0; }
                 if (row(2, "Audio", "->") && (act || lr > 0 || ImGui::IsItemClicked())) { menu_page = MenuPage::Audio; menu_idx = 0; }
@@ -903,6 +1045,8 @@ int main(int argc, char **argv) {
         }
     }
 
+    emu_worker.mark_render_done();
+    emu_worker.close();
     save_nvram(*game, data_dir + "/saves");
     cfg.save(settings_path);
     sound_worker.wait();

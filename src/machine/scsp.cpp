@@ -1222,6 +1222,11 @@ void scsp_device::DoMasterSamples(int samples)
 	}
 #endif
 
+	m_out.reserve(m_out.size() + size_t(samples) * 2);
+	m_DSP.EXTS[0] = 0;
+	m_DSP.EXTS[1] = 0;
+	const bool dac18b = DAC18B() != 0;
+
 	for (int s = 0; s < samples; ++s)
 	{
 		s32 smpl = 0, smpr = 0;
@@ -1328,27 +1333,15 @@ void scsp_device::DoMasterSamples(int samples)
 			if (m_probe) m_probe_efsdl[i] = EFSDL(slot);
 		}
 
-		for (int i = 0; i < 2; ++i)
+		if (dac18b)
 		{
-			SCSP_SLOT *slot = m_Slots + i + 16; // 100217, 100237 EFSDL, EFPAN for EXTS0/1
-			// !EFSDL case testable in saturn Multiplayer with Audio CD with default values.
-			u16 Enc = EFSDL(slot) ? ((EFPAN(slot)) << 0x8) | ((EFSDL(slot)) << 0xd) : (((DIPAN(slot)) << 0x8) | ((DISDL(slot)) << 0xd));
-			{
-				m_DSP.EXTS[i] = s32(0.0f * 32768.0);   // EXTS0/1: nothing connected
-				smpl += (m_DSP.EXTS[i] * m_LPANTABLE[Enc]) >> SHIFT;
-				smpr += (m_DSP.EXTS[i] * m_RPANTABLE[Enc]) >> SHIFT;
-			}
-		}
-
-		if (DAC18B())
-		{
-			m_out.push_back(float(double(std::clamp(smpl, -131072, 131072 - 1)) / 131072));
-			m_out.push_back(float(double(std::clamp(smpr, -131072, 131072 - 1)) / 131072));
+			m_out.push_back(float(std::clamp(smpl, -131072, 131072 - 1)) * (1.0f / 131072.0f));
+			m_out.push_back(float(std::clamp(smpr, -131072, 131072 - 1)) * (1.0f / 131072.0f));
 		}
 		else
 		{
-			m_out.push_back(float(double(std::clamp(smpl >> 2, -32768, 32768 - 1)) / 32768));
-			m_out.push_back(float(double(std::clamp(smpr >> 2, -32768, 32768 - 1)) / 32768));
+			m_out.push_back(float(std::clamp(smpl >> 2, -32768, 32768 - 1)) * (1.0f / 32768.0f));
+			m_out.push_back(float(std::clamp(smpr >> 2, -32768, 32768 - 1)) * (1.0f / 32768.0f));
 		}
 	}
 }

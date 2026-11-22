@@ -13,6 +13,10 @@
 #if defined(__ANDROID__)
 #include <pthread.h>
 #include <unistd.h>
+#elif defined(__linux__)
+#include <pthread.h>
+#include <sched.h>
+#include <unistd.h>
 #endif
 
 class row_pool
@@ -101,10 +105,22 @@ private:
 		int n = std::clamp(int(std::thread::hardware_concurrency()) - 2, 0, 11);
 		if (const char *t = getenv("VF2_THREADS")) n = std::clamp(atoi(t) - 1, 0, 31);   // testing: threads in all
 		for (int i = 0; i < n; i++)
-			m_workers.emplace_back([this] {
+			m_workers.emplace_back([this, i] {
 #ifdef __APPLE__
 				pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);   // (the performance cores)
+#elif defined(__linux__) && !defined(__ANDROID__)
+				if (const char *wc = getenv("VF2_WORKER_CORE")) {
+					const long ncpu = ::sysconf(_SC_NPROCESSORS_ONLN);
+					if (ncpu > 1) {
+						const int core = (atoi(wc) + i * 2) % int(ncpu);
+						cpu_set_t set;
+						CPU_ZERO(&set);
+						CPU_SET(core, &set);
+						::pthread_setaffinity_np(::pthread_self(), sizeof(set), &set);
+					}
+				}
 #endif
+				(void)i;
 				unsigned seen = 0;
 				for (;;) {
 					std::unique_lock<std::mutex> l(m_mu);

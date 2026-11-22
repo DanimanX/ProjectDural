@@ -40,9 +40,11 @@ struct SCSPDSP
 		u8 TABLE, MWT, MRD, EWT, EWA;
 		u8 ADRL, FRCL, SHIFT, YRL, NEGB, ZERO, BSEL;
 		u8 NOFL, COEF, MASA, ADREB, NXADR;
+		u8 odd_mrd, odd_mwt;
 		bool nop;
 	};
 	DecodedStep m_decoded[128];
+	int m_active_count = 0;
 	bool m_dirty = true;
 	void MarkDirty() { m_dirty = true; }
 	void DecodeSteps();

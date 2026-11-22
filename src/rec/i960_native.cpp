@@ -91,7 +91,8 @@ struct gen
 	native_stats &st;
 	std::unordered_map<uint32_t, sljit_label *> labels;
 	std::vector<std::pair<sljit_jump *, uint32_t>> to_label;
-	std::vector<sljit_jump *> to_exit, to_dispatch;
+	std::vector<sljit_jump *> to_exit, to_exit_r0, to_dispatch;
+	std::vector<std::pair<sljit_jump *, uint32_t>> to_exit_ip;
 	sljit_sw o_ip = 0, o_pip = 0, o_icount = 0, o_stalled = 0;
 	std::map<uint32_t, sljit_sw> spun;   // a spin loop's head -> its flag on the stack: it has run since the code was entered
 
@@ -115,16 +116,47 @@ struct gen
 	}
 
 	// ---- the common instructions as native code (execute_op's cases, the same cycles) ----
+	// Saved register allocation inside native block:
+	//   SLJIT_S0 = C *cpu
+	//   SLJIT_S1 = rt.nlabel.data() (dispatch table base)
+	//   SLJIT_S2 = rt.rpage.data()  (read page table base)
+	//   SLJIT_S3 = rt.wpage.data()  (write page table base)
+	//   SLJIT_S4 = int32_t icount   (cached m_icount register)
 	const bool native_ok = getenv("VF2_REC_CALLS") == nullptr;   // testing: every instruction through execute_op's case
 	sljit_sw o_r = 0, o_ac = 0;
 	uint8_t *const *rpage = nullptr, *const *wpage = nullptr;
+	int coalesced = 0;
+
+	void sync_ic_to_mem()
+	{
+		sljit_emit_op1(C_, SLJIT_MOV32, SLJIT_MEM1(SLJIT_S0), o_icount, SLJIT_S4, 0);
+	}
+	void sync_ic_from_mem()
+	{
+		sljit_emit_op1(C_, SLJIT_MOV_S32, SLJIT_S4, 0, SLJIT_MEM1(SLJIT_S0), o_icount);
+	}
+	void emit_ic_check(uint32_t resume_ip)
+	{
+		coalesced = 0;
+		to_exit_ip.push_back({ sljit_emit_cmp(C_, SLJIT_SIG_LESS_EQUAL | SLJIT_32, SLJIT_S4, 0, SLJIT_IMM, 0), resume_ip });
+	}
+	void emit_ic_check_ip_in_mem()
+	{
+		coalesced = 0;
+		to_exit.push_back(sljit_emit_cmp(C_, SLJIT_SIG_LESS_EQUAL | SLJIT_32, SLJIT_S4, 0, SLJIT_IMM, 0));
+	}
 
 	void call_op(const decoded &d)
 	{
+		const uint32_t a = d.addr, next = a + uint32_t(d.len);
+		sljit_emit_op1(C_, SLJIT_MOV32, SLJIT_MEM1(SLJIT_S0), o_pip, SLJIT_IMM, sljit_sw(a));
+		sljit_emit_op1(C_, SLJIT_MOV32, SLJIT_MEM1(SLJIT_S0), o_ip, SLJIT_IMM, sljit_sw(next));
+		sync_ic_to_mem();
 		sljit_emit_op1(C_, SLJIT_MOV, SLJIT_R0, 0, SLJIT_S0, 0);
 		sljit_emit_op1(C_, SLJIT_MOV32, SLJIT_R1, 0, SLJIT_IMM, sljit_sw(d.op));
 		sljit_emit_op1(C_, SLJIT_MOV32, SLJIT_R2, 0, SLJIT_IMM, sljit_sw(d.len == 8 ? d.disp : 0));
 		sljit_emit_icall(C_, SLJIT_CALL, SLJIT_ARGS3V(P, 32, 32), SLJIT_IMM, SLJIT_FUNC_ADDR(op_for(d.op)));
+		sync_ic_from_mem();
 	}
 	void stall_check()
 	{
@@ -134,7 +166,7 @@ struct gen
 	sljit_sw reg(int i) const { return o_r + 4 * i; }
 	void ld_r(sljit_s32 R, int i) { sljit_emit_op1(C_, SLJIT_MOV_U32, R, 0, SLJIT_MEM1(SLJIT_S0), reg(i)); }
 	void st_r(int i, sljit_s32 R) { sljit_emit_op1(C_, SLJIT_MOV32, SLJIT_MEM1(SLJIT_S0), reg(i), R, 0); }
-	void ic_sub(int k) { sljit_emit_op2(C_, SLJIT_SUB32, SLJIT_MEM1(SLJIT_S0), o_icount, SLJIT_MEM1(SLJIT_S0), o_icount, SLJIT_IMM, k); }
+	void ic_sub(int k) { sljit_emit_op2(C_, SLJIT_SUB32, SLJIT_S4, 0, SLJIT_S4, 0, SLJIT_IMM, k); }
 	void src1(sljit_s32 R, uint32_t op) { if (op & 0x800) sljit_emit_op1(C_, SLJIT_MOV32, R, 0, SLJIT_IMM, op & 0x1f); else ld_r(R, op & 0x1f); }
 	void src2(sljit_s32 R, uint32_t op) { if (op & 0x1000) sljit_emit_op1(C_, SLJIT_MOV32, R, 0, SLJIT_IMM, (op >> 14) & 0x1f); else ld_r(R, (op >> 14) & 0x1f); }
 	// get_ea into R1 (uses R0 too)
@@ -171,8 +203,8 @@ struct gen
 		}
 	}
 	// R2 = the page's memory for the address in R1 (u32), else a jump to `slow` (pushed): plain,
-	// below the pages' limit, aligned to `align`
-	void page(uint8_t *const *table, int align, std::vector<sljit_jump *> &slow)
+	// below the pages' limit, aligned to `align`, and not crossing a 4 KB page boundary when span > align
+	void page(sljit_s32 table_reg, int align, int span, std::vector<sljit_jump *> &slow)
 	{
 		if (align > 1) {
 			sljit_emit_op2u(C_, SLJIT_AND32 | SLJIT_SET_Z, SLJIT_R1, 0, SLJIT_IMM, align - 1);
@@ -180,10 +212,12 @@ struct gen
 		}
 		slow.push_back(sljit_emit_cmp(C_, SLJIT_GREATER_EQUAL | SLJIT_32, SLJIT_R1, 0, SLJIT_IMM, sljit_sw(runtime::PAGES << 12)));
 		sljit_emit_op2(C_, SLJIT_LSHR32, SLJIT_R3, 0, SLJIT_R1, 0, SLJIT_IMM, 12);
-		sljit_emit_op1(C_, SLJIT_MOV, SLJIT_R2, 0, SLJIT_IMM, sljit_sw(table));
-		sljit_emit_op1(C_, SLJIT_MOV, SLJIT_R2, 0, SLJIT_MEM2(SLJIT_R2, SLJIT_R3), SLJIT_WORD_SHIFT);
+		sljit_emit_op1(C_, SLJIT_MOV, SLJIT_R2, 0, SLJIT_MEM2(table_reg, SLJIT_R3), SLJIT_WORD_SHIFT);
 		slow.push_back(sljit_emit_cmp(C_, SLJIT_EQUAL, SLJIT_R2, 0, SLJIT_IMM, 0));
 		sljit_emit_op2(C_, SLJIT_AND32, SLJIT_R3, 0, SLJIT_R1, 0, SLJIT_IMM, 0xfff);
+		if (span > align) {
+			slow.push_back(sljit_emit_cmp(C_, SLJIT_GREATER | SLJIT_32, SLJIT_R3, 0, SLJIT_IMM, 0x1000 - span));
+		}
 	}
 	// AC's condition code from comparing R0 (src1) with R1 (src2): 4 less, 2 equal, 1 greater
 	void compare(bool sig)
@@ -204,28 +238,47 @@ struct gen
 		sljit_emit_op2(C_, SLJIT_OR32, SLJIT_R2, 0, SLJIT_R2, 0, R, 0);
 		sljit_emit_op1(C_, SLJIT_MOV32, SLJIT_MEM1(SLJIT_S0), o_ac, SLJIT_R2, 0);
 	}
-	// if AC & mask (or, mask 0: AC & 7 is 0), IP = target
-	void branch_if(uint32_t mask, uint32_t target)
+	// R0 = target if branch taken else fallthrough next
+	void branch_if(uint32_t mask, uint32_t target, uint32_t next)
 	{
+		sljit_emit_op1(C_, SLJIT_MOV32, SLJIT_R0, 0, SLJIT_IMM, sljit_sw(next));
 		sljit_emit_op1(C_, SLJIT_MOV_U32, SLJIT_R2, 0, SLJIT_MEM1(SLJIT_S0), o_ac);
 		sljit_emit_op2u(C_, SLJIT_AND32 | SLJIT_SET_Z, SLJIT_R2, 0, SLJIT_IMM, mask ? mask : 7);
 		sljit_jump *no = sljit_emit_jump(C_, mask ? SLJIT_ZERO : SLJIT_NOT_ZERO);
-		sljit_emit_op1(C_, SLJIT_MOV32, SLJIT_MEM1(SLJIT_S0), o_ip, SLJIT_IMM, sljit_sw(target));
+		sljit_emit_op1(C_, SLJIT_MOV32, SLJIT_R0, 0, SLJIT_IMM, sljit_sw(target));
 		sljit_set_label(no, sljit_emit_label(C_));
 	}
 
 	bool emit_inline(const decoded &d)
 	{
 		const uint32_t op = d.op, o = op >> 24, sub = (op >> 7) & 0xf, dst = (op >> 19) & 0x1f;
+		const uint32_t next = d.addr + uint32_t(d.len);
 		const bool lit_dst = op & 0x2000;
 		switch (o) {
 		case 0x08:   // b
 			ic_sub(1);
-			sljit_emit_op1(C_, SLJIT_MOV32, SLJIT_MEM1(SLJIT_S0), o_ip, SLJIT_IMM, sljit_sw(d.target));
+			return true;
+		case 0x0b:   // bal
+			ic_sub(5);
+			sljit_emit_op1(C_, SLJIT_MOV32, SLJIT_R0, 0, SLJIT_IMM, sljit_sw(next));
+			st_r(I960_G14, SLJIT_R0);
+			if (!d.has_target) sljit_emit_op1(C_, SLJIT_MOV32, SLJIT_MEM1(SLJIT_S0), o_ip, SLJIT_IMM, sljit_sw(d.target));
+			return true;
+		case 0x84:   // bx
+			if (!memb_mode_ok(op) || !ea(d)) return false;
+			ic_sub(3);
+			sljit_emit_op1(C_, SLJIT_MOV32, SLJIT_MEM1(SLJIT_S0), o_ip, SLJIT_R1, 0);
+			return true;
+		case 0x85:   // balx
+			if (!memb_mode_ok(op) || !ea(d)) return false;
+			ic_sub(5);
+			if (!d.has_target) sljit_emit_op1(C_, SLJIT_MOV32, SLJIT_MEM1(SLJIT_S0), o_ip, SLJIT_R1, 0);
+			sljit_emit_op1(C_, SLJIT_MOV32, SLJIT_R0, 0, SLJIT_IMM, sljit_sw(next));
+			st_r(dst, SLJIT_R0);
 			return true;
 		case 0x10: case 0x11: case 0x12: case 0x13: case 0x14: case 0x15: case 0x16: case 0x17:
 			ic_sub(1);
-			branch_if(o & 7, d.target);
+			branch_if(o & 7, d.target, next);
 			return true;
 		case 0x20: case 0x21: case 0x22: case 0x23: case 0x24: case 0x25: case 0x26: case 0x27: {   // testxx
 			ic_sub(1);
@@ -241,7 +294,7 @@ struct gen
 			if (op & 0x2000) sljit_emit_op1(C_, SLJIT_MOV32, SLJIT_R0, 0, SLJIT_IMM, (op >> 19) & 0x1f); else ld_r(SLJIT_R0, (op >> 19) & 0x1f);
 			ld_r(SLJIT_R1, (op >> 14) & 0x1f);
 			compare(o >= 0x39);
-			branch_if(o & 7, d.target);
+			branch_if(o & 7, d.target, next);
 			return true;
 		}
 		case 0x30: case 0x37: {   // bbc, bbs
@@ -251,15 +304,16 @@ struct gen
 			sljit_emit_op2(C_, SLJIT_AND32, SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_IMM, 0x1f);
 			sljit_emit_op2(C_, SLJIT_LSHR32, SLJIT_R1, 0, SLJIT_R1, 0, SLJIT_R0, 0);
 			sljit_emit_op2(C_, SLJIT_AND32, SLJIT_R1, 0, SLJIT_R1, 0, SLJIT_IMM, 1);   // the bit
-			// taken (bbc: clear, bbs: set): cc 2 and IP = target; else cc 0
+			// taken (bbc: clear, bbs: set): cc 2 and R0 = target; else cc 0 and R0 = next
 			sljit_jump *notaken = sljit_emit_cmp(C_, SLJIT_EQUAL | SLJIT_32, SLJIT_R1, 0, SLJIT_IMM, o == 0x30 ? 1 : 0);
 			sljit_emit_op1(C_, SLJIT_MOV32, SLJIT_R3, 0, SLJIT_IMM, 2);
 			set_cc(SLJIT_R3);
-			sljit_emit_op1(C_, SLJIT_MOV32, SLJIT_MEM1(SLJIT_S0), o_ip, SLJIT_IMM, sljit_sw(d.target));
+			sljit_emit_op1(C_, SLJIT_MOV32, SLJIT_R0, 0, SLJIT_IMM, sljit_sw(d.target));
 			sljit_jump *done = sljit_emit_jump(C_, SLJIT_JUMP);
 			sljit_set_label(notaken, sljit_emit_label(C_));
 			sljit_emit_op1(C_, SLJIT_MOV32, SLJIT_R3, 0, SLJIT_IMM, 0);
 			set_cc(SLJIT_R3);
+			sljit_emit_op1(C_, SLJIT_MOV32, SLJIT_R0, 0, SLJIT_IMM, sljit_sw(next));
 			sljit_set_label(done, sljit_emit_label(C_));
 			return true;
 		}
@@ -267,15 +321,24 @@ struct gen
 			if (lit_dst) return false;
 			int cost = 1;
 			sljit_s32 alu = 0;
-			bool inv1 = false, inv2 = false;
+			bool inv1 = false, inv2 = false, inv_out = false;
 			switch (sub) {
 			case 0x1: alu = SLJIT_AND32; break;                      // and
 			case 0x2: alu = SLJIT_AND32; inv1 = true; break;         // andnot: t2 & ~t1
 			case 0x4: alu = SLJIT_AND32; inv2 = true; break;         // notand: ~t2 & t1
 			case 0x6: alu = SLJIT_XOR32; break;                      // xor
 			case 0x7: alu = SLJIT_OR32; break;                       // or
+			case 0x8: alu = SLJIT_OR32; inv_out = true; break;       // nor: ~(t2 | t1)
+			case 0x9: alu = SLJIT_XOR32; inv_out = true; break;      // xnor: ~(t2 ^ t1)
+			case 0xa:                                                // not: ~t1
+				ic_sub(1);
+				src1(SLJIT_R0, op);
+				sljit_emit_op2(C_, SLJIT_XOR32, SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_IMM, -1);
+				st_r(dst, SLJIT_R0);
+				return true;
 			case 0xb: alu = SLJIT_OR32; inv1 = true; break;          // ornot: t2 | ~t1
 			case 0xd: alu = SLJIT_OR32; inv2 = true; break;          // notor: ~t2 | t1
+			case 0xe: alu = SLJIT_AND32; inv_out = true; cost = 2; break; // nand: ~(t2 & t1)
 			case 0x3: case 0xc: case 0x0: {                          // setbit, clrbit, notbit
 				ic_sub(2);
 				src1(SLJIT_R0, op); src2(SLJIT_R1, op);
@@ -295,6 +358,7 @@ struct gen
 			if (inv1) sljit_emit_op2(C_, SLJIT_XOR32, SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_IMM, -1);
 			if (inv2) sljit_emit_op2(C_, SLJIT_XOR32, SLJIT_R1, 0, SLJIT_R1, 0, SLJIT_IMM, -1);
 			sljit_emit_op2(C_, alu, SLJIT_R1, 0, SLJIT_R1, 0, SLJIT_R0, 0);
+			if (inv_out) sljit_emit_op2(C_, SLJIT_XOR32, SLJIT_R1, 0, SLJIT_R1, 0, SLJIT_IMM, -1);
 			st_r(dst, SLJIT_R1);
 			return true;
 		}
@@ -339,8 +403,24 @@ struct gen
 				sljit_emit_op2(C_, sub < 6 ? SLJIT_ADD32 : SLJIT_SUB32, SLJIT_R1, 0, SLJIT_R1, 0, SLJIT_IMM, 1);
 				st_r(dst, SLJIT_R1);
 				return true;
+			case 0xe:   // chkbit
+				ic_sub(2);
+				src1(SLJIT_R0, op); src2(SLJIT_R1, op);
+				sljit_emit_op2(C_, SLJIT_AND32, SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_IMM, 31);
+				sljit_emit_op2(C_, SLJIT_LSHR32, SLJIT_R1, 0, SLJIT_R1, 0, SLJIT_R0, 0);
+				sljit_emit_op2(C_, SLJIT_AND32, SLJIT_R1, 0, SLJIT_R1, 0, SLJIT_IMM, 1);
+				sljit_emit_op2(C_, SLJIT_SHL32, SLJIT_R1, 0, SLJIT_R1, 0, SLJIT_IMM, 1);
+				set_cc(SLJIT_R1);
+				return true;
 			default: return false;
 			}
+		case 0x70: case 0x74:   // mulo, muli (sub 0x1)
+			if (sub != 0x1 || lit_dst) return false;
+			ic_sub(18);
+			src1(SLJIT_R0, op); src2(SLJIT_R1, op);
+			sljit_emit_op2(C_, SLJIT_MUL32, SLJIT_R1, 0, SLJIT_R1, 0, SLJIT_R0, 0);
+			st_r(dst, SLJIT_R1);
+			return true;
 		case 0x5c: case 0x5d: case 0x5e: case 0x5f: {   // mov, movl, movt, movq
 			if (sub != 0xc) return false;
 			const int n = int(o - 0x5c) + 1;
@@ -366,11 +446,33 @@ struct gen
 			const int size = o == 0x90 ? 4 : (o == 0x88 || o == 0xc8) ? 2 : 1;
 			std::vector<sljit_jump *> slow;
 			if (!ea(d)) return false;
-			page(rpage, size, slow);
-			ic_sub(4);
+			page(SLJIT_S2, size, size, slow);
 			const sljit_s32 mv = size == 4 ? SLJIT_MOV_U32 : o == 0x80 ? SLJIT_MOV_U8 : o == 0xc0 ? SLJIT_MOV_S8 : o == 0x88 ? SLJIT_MOV_U16 : SLJIT_MOV_S16;
 			sljit_emit_op1(C_, mv, SLJIT_R0, 0, SLJIT_MEM2(SLJIT_R2, SLJIT_R3), 0);
 			st_r(dst, SLJIT_R0);
+			ic_sub(4);
+			sljit_jump *done = sljit_emit_jump(C_, SLJIT_JUMP);
+			sljit_label *sl = sljit_emit_label(C_);
+			for (sljit_jump *j : slow) sljit_set_label(j, sl);
+			call_op(d);
+			stall_check();
+			sljit_set_label(done, sljit_emit_label(C_));
+			return true;
+		}
+		case 0x98: case 0xa0: case 0xb0: {   // ldl, ldt, ldq (single-page aligned plain RAM fast path)
+			if (!memb_mode_ok(op)) return false;
+			const int n = o == 0x98 ? 2 : o == 0xa0 ? 3 : 4;
+			const uint32_t t2 = o == 0x98 ? ((op >> 19) & 0x1eu) : ((op >> 19) & 0x1cu);
+			if (t2 + n > 32) return false;
+			std::vector<sljit_jump *> slow;
+			if (!ea(d)) return false;
+			page(SLJIT_S2, 4, n * 4, slow);
+			sljit_emit_op2(C_, SLJIT_ADD, SLJIT_R2, 0, SLJIT_R2, 0, SLJIT_R3, 0);
+			for (int i = 0; i < n; ++i) {
+				sljit_emit_op1(C_, SLJIT_MOV_U32, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_R2), i * 4);
+				st_r(int(t2) + i, SLJIT_R0);
+			}
+			ic_sub(n + 3);
 			sljit_jump *done = sljit_emit_jump(C_, SLJIT_JUMP);
 			sljit_label *sl = sljit_emit_label(C_);
 			for (sljit_jump *j : slow) sljit_set_label(j, sl);
@@ -384,10 +486,31 @@ struct gen
 			const int size = o == 0x92 ? 4 : (o == 0x8a || o == 0xca) ? 2 : 1;
 			std::vector<sljit_jump *> slow;
 			if (!ea(d)) return false;
-			page(wpage, size, slow);
-			ic_sub(2);
+			page(SLJIT_S3, size, size, slow);
 			ld_r(SLJIT_R0, dst);
 			sljit_emit_op1(C_, size == 4 ? SLJIT_MOV32 : size == 2 ? SLJIT_MOV_U16 : SLJIT_MOV_U8, SLJIT_MEM2(SLJIT_R2, SLJIT_R3), 0, SLJIT_R0, 0);
+			ic_sub(2);
+			sljit_jump *done = sljit_emit_jump(C_, SLJIT_JUMP);
+			sljit_label *sl = sljit_emit_label(C_);
+			for (sljit_jump *j : slow) sljit_set_label(j, sl);
+			call_op(d);
+			sljit_set_label(done, sljit_emit_label(C_));
+			return true;
+		}
+		case 0x9a: case 0xa2: case 0xb2: {   // stl, stt, stq (single-page aligned plain RAM fast path)
+			if (!memb_mode_ok(op)) return false;
+			const int n = o == 0x9a ? 2 : o == 0xa2 ? 3 : 4;
+			const uint32_t t2 = o == 0x9a ? ((op >> 19) & 0x1eu) : ((op >> 19) & 0x1cu);
+			if (t2 + n > 32) return false;
+			std::vector<sljit_jump *> slow;
+			if (!ea(d)) return false;
+			page(SLJIT_S3, 4, n * 4, slow);
+			sljit_emit_op2(C_, SLJIT_ADD, SLJIT_R2, 0, SLJIT_R2, 0, SLJIT_R3, 0);
+			for (int i = 0; i < n; ++i) {
+				ld_r(SLJIT_R0, int(t2) + i);
+				sljit_emit_op1(C_, SLJIT_MOV32, SLJIT_MEM1(SLJIT_R2), i * 4, SLJIT_R0, 0);
+			}
+			ic_sub(n + 1);
 			sljit_jump *done = sljit_emit_jump(C_, SLJIT_JUMP);
 			sljit_label *sl = sljit_emit_label(C_);
 			for (sljit_jump *j : slow) sljit_set_label(j, sl);
@@ -400,66 +523,105 @@ struct gen
 		}
 	}
 
-	void insn(const decoded &d, uint32_t next_emitted)
+	void insn(const decoded &d, uint32_t next_emitted, bool next_is_entry)
 	{
 		const uint32_t a = d.addr, next = a + uint32_t(d.len), o = d.op >> 24;
 		labels[a] = sljit_emit_label(C_);
 		if (d.k == kind::bad) {   // the interpreter's (back to the loop at it)
+			coalesced = 0;
 			sljit_emit_op1(C_, SLJIT_MOV32, SLJIT_MEM1(SLJIT_S0), o_ip, SLJIT_IMM, a);
 			to_exit.push_back(sljit_emit_jump(C_, SLJIT_JUMP));
 			return;
 		}
 		st.instructions++;
 		if (auto h = spun.find(a); h != spun.end()) sljit_emit_op1(C_, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), h->second, SLJIT_IMM, 1);
-		sljit_emit_op1(C_, SLJIT_MOV32, SLJIT_MEM1(SLJIT_S0), o_pip, SLJIT_IMM, a);
-		sljit_emit_op1(C_, SLJIT_MOV32, SLJIT_MEM1(SLJIT_S0), o_ip, SLJIT_IMM, next);
 		const bool may_stall = o == 0x80 || o == 0x88 || o == 0x90 || o == 0x98 || o == 0xa0 || o == 0xb0 || o == 0xc0 || o == 0xc8 ||
 							   o == 0x60 || o == 0x66 || o == 0x0a;
-		if (native_ok && emit_inline(d)) st.native++;
+		const bool inlined = native_ok && emit_inline(d);
+		if (inlined) st.native++;
 		else {
-			// execute_op's case for it
+			// execute_op's case for it (stores o_pip, o_ip, syncs icount)
 			call_op(d);
 			if (may_stall) stall_check();   // a stalled read: the loop retries it
 		}
-		// the slice's cycles
-		sljit_emit_op1(C_, SLJIT_MOV_S32, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_S0), o_icount);
-		to_exit.push_back(sljit_emit_cmp(C_, SLJIT_SIG_LESS_EQUAL | SLJIT_32, SLJIT_R0, 0, SLJIT_IMM, 0));
-		auto on = [&]() { if (next_emitted != next) go(next); };
+		// Coalesce icount check across straight-line basic blocks of pure register inline instructions
+		const bool pure_reg = (o < 0x80 || o == 0x8c) && o != 0x65 && o != 0x60 && o != 0x6e;
+		const bool can_coalesce = inlined && d.k == kind::normal && pure_reg &&
+								  next_emitted == next && !next_is_entry && coalesced < 16;
+		if (can_coalesce) {
+			++coalesced;
+			return;
+		}
+
+		auto on = [&]() {
+			if (next_emitted != next) {
+				if (!compiled(next)) sljit_emit_op1(C_, SLJIT_MOV32, SLJIT_MEM1(SLJIT_S0), o_ip, SLJIT_IMM, sljit_sw(next));
+				go(next);
+			}
+		};
 		switch (d.k) {
 		case kind::normal:
-			if (o == 0x65 || o == 0x60 || o == 0x6e) {   // (may have taken an interrupt)
+			if (o == 0x65 || o == 0x60 || o == 0x6e) {   // (may have taken an interrupt: call_op updated o_ip)
+				emit_ic_check_ip_in_mem();
 				load_ip();
 				to_dispatch.push_back(sljit_emit_cmp(C_, SLJIT_NOT_EQUAL | SLJIT_32, SLJIT_R0, 0, SLJIT_IMM, next));
+			} else {
+				emit_ic_check(next);
 			}
 			on();
 			break;
 		case kind::branch: {
-			load_ip();
+			if (!inlined) load_ip();
+			// R0 now holds the target IP (either from inline branch_if or loaded from o_ip)
+			coalesced = 0;
+			if (inlined) to_exit_r0.push_back(sljit_emit_cmp(C_, SLJIT_SIG_LESS_EQUAL | SLJIT_32, SLJIT_S4, 0, SLJIT_IMM, 0));
+			else to_exit.push_back(sljit_emit_cmp(C_, SLJIT_SIG_LESS_EQUAL | SLJIT_32, SLJIT_S4, 0, SLJIT_IMM, 0));
+
 			auto sp = p.spins.find(a);
 			if (sp != p.spins.end() && compiled(d.target)) {
 				sljit_jump *no = sljit_emit_cmp(C_, SLJIT_NOT_EQUAL | SLJIT_32, SLJIT_R0, 0, SLJIT_IMM, d.target);
 				// (only when the last time round all ran since the code was entered: in this slice)
 				sljit_jump *fresh = sljit_emit_cmp(C_, SLJIT_EQUAL, SLJIT_MEM1(SLJIT_SP), spun.at(d.target), SLJIT_IMM, 0);
+				sync_ic_to_mem();
 				sljit_emit_op1(C_, SLJIT_MOV, SLJIT_R0, 0, SLJIT_S0, 0);
 				sljit_emit_op1(C_, SLJIT_MOV32, SLJIT_R1, 0, SLJIT_IMM, sp->second.cost);
 				sljit_emit_op1(C_, SLJIT_MOV, SLJIT_R2, 0, SLJIT_IMM, sljit_sw(&sp->second.loads));
 				sljit_emit_icall(C_, SLJIT_CALL, SLJIT_ARGS3V(P, 32, W), SLJIT_IMM, SLJIT_FUNC_ADDR(h_spin));
+				sync_ic_from_mem();
 				sljit_set_label(fresh, sljit_emit_label(C_));
 				go(d.target);
 				sljit_set_label(no, sljit_emit_label(C_));
-			} else
+			} else {
+				if (!compiled(d.target) && inlined)
+					sljit_emit_op1(C_, SLJIT_MOV32, SLJIT_MEM1(SLJIT_S0), o_ip, SLJIT_R0, 0);
 				if_ip(d.target);
+			}
 			if (d.target != next) on();
 			break;
 		}
 		case kind::jump:
-			go(d.target);
+			if (compiled(d.target)) {
+				emit_ic_check(d.target);
+				go(d.target);
+			} else {
+				if (inlined) sljit_emit_op1(C_, SLJIT_MOV32, SLJIT_MEM1(SLJIT_S0), o_ip, SLJIT_IMM, sljit_sw(d.target));
+				emit_ic_check_ip_in_mem();
+				to_dispatch.push_back(sljit_emit_jump(C_, SLJIT_JUMP));
+			}
 			break;
 		case kind::call:
-			if (d.has_target) go(d.target);
-			else to_dispatch.push_back(sljit_emit_jump(C_, SLJIT_JUMP));
+			if (d.has_target && compiled(d.target)) {
+				emit_ic_check(d.target);
+				go(d.target);
+			} else {
+				if (d.has_target && inlined)
+					sljit_emit_op1(C_, SLJIT_MOV32, SLJIT_MEM1(SLJIT_S0), o_ip, SLJIT_IMM, sljit_sw(d.target));
+				emit_ic_check_ip_in_mem();
+				to_dispatch.push_back(sljit_emit_jump(C_, SLJIT_JUMP));
+			}
 			break;
 		case kind::ijump:
+			emit_ic_check_ip_in_mem();
 			if (auto it = p.hinted.find(a); it != p.hinted.end()) {
 				load_ip();
 				for (uint32_t t : it->second) if (compiled(t)) if_ip(t);
@@ -467,6 +629,7 @@ struct gen
 			to_dispatch.push_back(sljit_emit_jump(C_, SLJIT_JUMP));
 			break;
 		case kind::ret:
+			emit_ic_check_ip_in_mem();
 			to_dispatch.push_back(sljit_emit_jump(C_, SLJIT_JUMP));
 			break;
 		default:
@@ -486,34 +649,74 @@ struct gen
 		o_ac = off(&R::ac(cpu));
 		rpage = rt.rpage.data();
 		wpage = rt.wpage.data();
+		rt.nlabel.assign(runtime::LIMIT / 4, 0);
 		for (auto &[br, sp] : p.spins)
 			if (compiled(sp.head) && !spun.count(sp.head)) { const sljit_sw at = sljit_sw(spun.size() * sizeof(sljit_sw)); spun[sp.head] = at; }
-		// entry(c, label): the spin loops' flags cleared, then straight to the instruction's code
-		sljit_emit_enter(C_, 0, SLJIT_ARGS2V(P, W), 4, 2, sljit_s32(spun.size() * sizeof(sljit_sw)));
+		// entry(c, label): load pinned registers S2=rpage, S3=wpage, S4=icount, jump to label, then replace S1=rt.nlabel.data()
+		sljit_emit_enter(C_, 0, SLJIT_ARGS2V(P, W), 4, 5, sljit_s32(spun.size() * sizeof(sljit_sw)));
 		for (auto &[h, at] : spun) sljit_emit_op1(C_, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), at, SLJIT_IMM, 0);
-		sljit_emit_ijump(C_, SLJIT_JUMP, SLJIT_S1, 0);
+		sljit_emit_op1(C_, SLJIT_MOV, SLJIT_R0, 0, SLJIT_S1, 0);
+		sljit_emit_op1(C_, SLJIT_MOV, SLJIT_S1, 0, SLJIT_IMM, sljit_sw(rt.nlabel.data()));
+		sljit_emit_op1(C_, SLJIT_MOV, SLJIT_S2, 0, SLJIT_IMM, sljit_sw(rpage));
+		sljit_emit_op1(C_, SLJIT_MOV, SLJIT_S3, 0, SLJIT_IMM, sljit_sw(wpage));
+		sync_ic_from_mem();
+		sljit_emit_ijump(C_, SLJIT_JUMP, SLJIT_R0, 0);
 		// every instruction, in address order (the flow from one to another as jumps)
 		std::vector<uint32_t> order;
+		order.reserve(p.insns.size());
 		for (auto &[a, d] : p.insns) if (p.owner.count(a)) order.push_back(a);
-		for (size_t i = 0; i < order.size(); i++)
-			insn(p.insns.at(order[i]), i + 1 < order.size() ? order[i + 1] : ~0u);
-		// back to the loop
+
+		// Mark all branch/jump/call/hint/spin targets and function entry points so basic-block coalescing only happens on internal straight-line insns
+		std::vector<uint8_t> is_target(runtime::LIMIT / 4, 0);
+		auto mark_t = [&](uint32_t addr) { if (addr < runtime::LIMIT && !(addr & 3)) is_target[addr >> 2] = 1; };
+		for (const auto &fn : p.functions) mark_t(fn.entry);
+		for (auto &[br, sp] : p.spins) mark_t(sp.head);
+		for (auto &[a, vec] : p.hinted) for (uint32_t t : vec) mark_t(t);
+		for (uint32_t a : order) {
+			const decoded &d = p.insns.at(a);
+			if (d.has_target) mark_t(d.target);
+			// Any instruction following a non-normal or call instruction could be returned to or entered
+			if (d.k != kind::normal || (d.op >> 24) == 0x65 || (d.op >> 24) == 0x60 || (d.op >> 24) == 0x6e)
+				mark_t(a + uint32_t(d.len));
+			if (!(native_ok && ((d.op >> 24) != 0x09 && (d.op >> 24) != 0x0a && (d.op >> 24) != 0x66 && (d.op >> 24) != 0x86))) {
+				// ensure label exists if previous wasn't coalesced
+			}
+		}
+
+		for (size_t i = 0; i < order.size(); i++) {
+			const uint32_t next_a = i + 1 < order.size() ? order[i + 1] : ~0u;
+			const bool next_entry = (next_a < runtime::LIMIT && !(next_a & 3)) ? (is_target[next_a >> 2] != 0) : true;
+			insn(p.insns.at(order[i]), next_a, next_entry);
+		}
+		// back to the loop: write cached icount (S4) back to cpu.m_icount
+		sljit_label *exit_r0 = sljit_emit_label(C_);
+		sljit_emit_op1(C_, SLJIT_MOV32, SLJIT_MEM1(SLJIT_S0), o_ip, SLJIT_R0, 0);
 		sljit_label *exit = sljit_emit_label(C_);
+		sljit_emit_op1(C_, SLJIT_MOV32, SLJIT_MEM1(SLJIT_S0), o_icount, SLJIT_S4, 0);
 		sljit_emit_return_void(C_);
-		// IP is somewhere else: its code, if there's some
+		// IP is somewhere else: inline table lookup in S1 (rt.nlabel.data()) without a C function call
 		sljit_label *dispatch = sljit_emit_label(C_);
-		sljit_emit_op1(C_, SLJIT_MOV, SLJIT_R0, 0, SLJIT_S0, 0);
-		sljit_emit_icall(C_, SLJIT_CALL, SLJIT_ARGS1(W, P), SLJIT_IMM, SLJIT_FUNC_ADDR(h_label));
-		sljit_jump *none = sljit_emit_cmp(C_, SLJIT_EQUAL, SLJIT_R0, 0, SLJIT_IMM, 0);
+		sljit_emit_op1(C_, SLJIT_MOV_U32, SLJIT_R0, 0, SLJIT_MEM1(SLJIT_S0), o_ip);
+		sljit_emit_op2u(C_, SLJIT_AND32 | SLJIT_SET_Z, SLJIT_R0, 0, SLJIT_IMM, 3);
+		to_exit.push_back(sljit_emit_jump(C_, SLJIT_NOT_ZERO));
+		to_exit.push_back(sljit_emit_cmp(C_, SLJIT_GREATER_EQUAL | SLJIT_32, SLJIT_R0, 0, SLJIT_IMM, sljit_sw(runtime::LIMIT)));
+		sljit_emit_op2(C_, SLJIT_LSHR32, SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_IMM, 2);
+		sljit_emit_op1(C_, SLJIT_MOV, SLJIT_R0, 0, SLJIT_MEM2(SLJIT_S1, SLJIT_R0), SLJIT_WORD_SHIFT);
+		to_exit.push_back(sljit_emit_cmp(C_, SLJIT_EQUAL, SLJIT_R0, 0, SLJIT_IMM, 0));
 		sljit_emit_ijump(C_, SLJIT_JUMP, SLJIT_R0, 0);
-		sljit_set_label(none, exit);
+		// Out-of-line cold stubs for timeslice expiration
+		for (auto &[j, ip] : to_exit_ip) {
+			sljit_set_label(j, sljit_emit_label(C_));
+			sljit_emit_op1(C_, SLJIT_MOV32, SLJIT_MEM1(SLJIT_S0), o_ip, SLJIT_IMM, sljit_sw(ip));
+			to_exit.push_back(sljit_emit_jump(C_, SLJIT_JUMP));
+		}
+		for (sljit_jump *j : to_exit_r0) sljit_set_label(j, exit_r0);
 		for (sljit_jump *j : to_exit) sljit_set_label(j, exit);
 		for (sljit_jump *j : to_dispatch) sljit_set_label(j, dispatch);
 		for (auto &[j, t] : to_label) sljit_set_label(j, labels.at(t));
 		void *code = sljit_generate_code(C_, 0, nullptr);
 		if (!code) { sljit_free_compiler(C_); return nullptr; }
 		st.code_bytes = sljit_get_generated_code_size(C_);
-		rt.nlabel.assign(runtime::LIMIT / 4, 0);
 		for (auto &[a, l] : labels)
 			if (a < runtime::LIMIT && p.insns.at(a).k != kind::bad) rt.nlabel[a >> 2] = sljit_get_label_addr(l);
 		sljit_free_compiler(C_);

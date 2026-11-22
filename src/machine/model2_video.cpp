@@ -205,43 +205,49 @@ inline u16 model2_video::float_to_zval(float floatval, s32 z_adjust)
 		return 0xffff; // above 14 is too large
 }
 
-static int32_t clip_polygon(poly_vertex *v, int32_t num_vertices, poly_vertex *vout, model2_video::plane clip_plane)
+static inline int32_t clip_polygon(const poly_vertex *v, int32_t num_vertices, poly_vertex *vout, const model2_video::plane &clip_plane)
 {
-	int32_t outcount = 0;
-
-	const poly_vertex *cur = v;
-	poly_vertex *out = vout;
-
-	float curdot = dot_product(*cur, clip_plane.normal);
-	int32_t curin = (curdot >= clip_plane.distance) ? 1 : 0;
-
+	float dots[8];
+	uint32_t in_mask = 0;
 	for (int32_t i = 0; i < num_vertices; i++)
 	{
-		const int32_t nextvert = (i + 1) % num_vertices;
+		const float d = dot_product(v[i], clip_plane.normal);
+		dots[i] = d;
+		if (d >= clip_plane.distance)
+			in_mask |= (1u << i);
+	}
+	if (in_mask == 0)
+		return 0;
+	if (in_mask == (1u << num_vertices) - 1u)
+		return -1;
 
-		/* if the current point is inside the plane, add it */
+	int32_t outcount = 0;
+	for (int32_t i = 0; i < num_vertices; i++)
+	{
+		const int32_t nextvert = (i + 1 == num_vertices) ? 0 : (i + 1);
+		const int32_t curin = (in_mask >> i) & 1;
+		const int32_t nextin = (in_mask >> nextvert) & 1;
+
 		if (curin)
-			out[outcount++] = *cur;
+			vout[outcount++] = v[i];
 
-		const float nextdot = dot_product(v[nextvert], clip_plane.normal);
-		const int32_t nextin = (nextdot >= clip_plane.distance) ? 1 : 0;
-
-		/* Add a clipped vertex if one end of the current edge is inside the plane and the other is outside */
-		if ((curin != nextin) && !std::isnan(curdot) && !std::isnan(nextdot))
+		if (curin != nextin)
 		{
-			const float scale = (clip_plane.distance - curdot) / (nextdot - curdot);
-
-			out[outcount].x = cur->x + ((v[nextvert].x - cur->x) * scale);
-			out[outcount].y = cur->y + ((v[nextvert].y - cur->y) * scale);
-			out[outcount].pz = cur->pz + ((v[nextvert].pz - cur->pz) * scale);
-			out[outcount].pu = cur->pu + ((v[nextvert].pu - cur->pu) * scale);
-			out[outcount].pv = cur->pv + ((v[nextvert].pv - cur->pv) * scale);
-			outcount++;
+			const float curdot = dots[i];
+			const float nextdot = dots[nextvert];
+			if (!std::isnan(curdot) && !std::isnan(nextdot))
+			{
+				const float scale = (clip_plane.distance - curdot) / (nextdot - curdot);
+				const poly_vertex &cur = v[i];
+				const poly_vertex &nxt = v[nextvert];
+				vout[outcount].x = cur.x + ((nxt.x - cur.x) * scale);
+				vout[outcount].y = cur.y + ((nxt.y - cur.y) * scale);
+				vout[outcount].pz = cur.pz + ((nxt.pz - cur.pz) * scale);
+				vout[outcount].pu = cur.pu + ((nxt.pu - cur.pu) * scale);
+				vout[outcount].pv = cur.pv + ((nxt.pv - cur.pv) * scale);
+				outcount++;
+			}
 		}
-
-		curdot = nextdot;
-		curin = nextin;
-		cur++;
 	}
 
 	return outcount;
@@ -258,7 +264,7 @@ static int32_t clip_polygon(poly_vertex *v, int32_t num_vertices, poly_vertex *v
 // vertices' nearest or farthest instead, as its mode asks; anything that shows in the 4:3 keeps
 // the arcade's key, so the 4:3 part of the picture is as it was. (The key carried on to the next
 // polygons, polygon_z, stays the arcade's.)
-static float side_sort_z(const model2_video::raster_state *raster, int ext, u32 attr, float zvalue, const poly_vertex *v, int n, bool see_through)
+static inline float side_sort_z(const model2_video::raster_state *raster, int ext, u32 attr, float zvalue, const poly_vertex *v, int n, bool see_through)
 {
 	const int mode = (attr >> 10) & 3;
 	if (!raster->widened || (mode != 1 && mode != 2)) return zvalue;
@@ -266,15 +272,19 @@ static float side_sort_z(const model2_video::raster_state *raster, int ext, u32 
 	const float c = raster->center[raster->center_sel][0];
 	const float lo = raster->viewport[0] + ext - c, hi = raster->viewport[2] - ext - c;
 	bool left = true, right = true;
-	float zmin = v[0].pz, zmax = v[0].pz;
 	for (int i = 0; i < n; i++) {
-		const float dx = v[i].x / (v[i].pz + std::numeric_limits<float>::min());
-		left = left && dx <= lo;
-		right = right && dx >= hi;
+		const float z = v[i].pz;
+		if (z <= 0.0f) return zvalue;
+		const float x = v[i].x;
+		left = left && (x <= lo * z);
+		right = right && (x >= hi * z);
+		if (!left && !right) return zvalue;
+	}
+	float zmin = v[0].pz, zmax = v[0].pz;
+	for (int i = 1; i < n; i++) {
 		zmin = std::min(zmin, v[i].pz);
 		zmax = std::max(zmax, v[i].pz);
 	}
-	if (!left && !right) return zvalue;
 	// A see-through polygon of the stage's far scenery (beyond 15, the fighters well in front of
 	// it) that faces the camera (its depth across it under a tenth of its depth: a tree's leaves)
 	// goes no nearer than its middle: by its nearest corner, Lau's tree and the tower beside it took
@@ -304,7 +314,7 @@ inline bool model2_video::check_culling(raster_state *raster, u32 attr, float mi
 		return true;
 
 	/* if the minimum z value is bigger than the master z clip value, don't render */
-	if (raster->master_z_clip != 0xff && (int32_t)(1.0 / min_z) > raster->master_z_clip && raster->fc_near <= 0)   // (the free camera: its near plane)
+	if (raster->master_z_clip != 0xff && (int32_t)(1.0f / min_z) > raster->master_z_clip && raster->fc_near <= 0)   // (the free camera: its near plane)
 		return true;
 
 	/* if the maximum z value is < 0 then we can safely clip the entire polygon */
@@ -547,13 +557,15 @@ void model2_video::drawn_rows(const bitmap_rgb32 *map, int &y0, int &y1) const
 int model2_video::polygons_shown() const
 {
 	const int p = shown_now();
-	return !m_render_test_mode && p >= 0 ? int(m_pictures[p].drawn.size()) : 0;
+	if (m_render_test_mode || p < 0) return 0;
+	return int(m_pictures[p].gpu_polys.empty() ? m_pictures[p].drawn.size() : m_pictures[p].gpu_polys.size());
 }
 
 int model2_video::polygons_drawn(int ago) const
 {
 	const int p = m_shown[2 - std::clamp(ago, 0, 2)];
-	return p >= 0 ? int(m_pictures[p].drawn.size()) : 0;
+	if (p < 0) return 0;
+	return int(m_pictures[p].gpu_polys.empty() ? m_pictures[p].drawn.size() : m_pictures[p].gpu_polys.size());
 }
 
 void model2_video::set_delay(int frames, bool cut)
@@ -692,54 +704,15 @@ void model2_video::model2_3d_process_polygon(raster_state *raster, u32 attr)
 	if (object.v[2].pz > max_z) max_z = object.v[2].pz;
 	if (NumVerts == 4 && object.v[3].pz > max_z) max_z = object.v[3].pz;
 
-	/* read in the texture information */
-
-	/* texture point data (each word's address kept to the memory, as the first's: points at its end, a display list
-	   from a snapshot's RAM, read past it) */
+	/* texture point & header addresses: always advance command_buffer[0..1], but only read texture_rom/log_ram if not culled! */
 	const u32 tpa = raster->command_buffer[0];
-	auto tpr = [&](u32 k) -> u16 { return tpa & 0x800000 ? raster->texture_ram[(tpa + k) & 0xffff] : raster->texture_rom[(tpa + k) & raster->texture_rom_mask]; };
-	object.v[0].pv = tpr(0);
-	object.v[0].pu = tpr(1);
-	object.v[1].pv = tpr(2);
-	object.v[1].pu = tpr(3);
-	object.v[2].pv = tpr(4);
-	object.v[2].pu = tpr(5);
-	if (NumVerts == 4)
-	{
-		object.v[3].pv = tpr(6);
-		object.v[3].pu = tpr(7);
-	}
-
-	/* update the address */
 	raster->command_buffer[0] += NumVerts * 2;
 
-	/* texture header data (as the points') */
 	const u32 tha = raster->command_buffer[1];
-	auto thr = [&](u32 k) -> u16 { return tha & 0x800000 ? raster->texture_ram[(tha + k) & 0xffff] : raster->texture_rom[(tha + k) & raster->texture_rom_mask]; };
-	object.texheader[0] = thr(0);
-	object.texheader[1] = thr(1);
-	object.texheader[2] = thr(2);
-	object.texheader[3] = thr(3);
-
-	/* extract the texture header offset */
 	tho = (attr >> 12) & 0x1f;
-
-	/* adjust for sign */
 	if (tho & 0x10)
 		tho |= -16;
-
-	/* update the address */
 	raster->command_buffer[1] += tho * 4;
-
-	/* set the luma value of this polygon */
-	object.luma = (raster->command_buffer[9] >> 15) & 0xff;
-
-	/* set the texture LOD of this polygon */
-	object.texlod = ((raster->command_buffer[10] >> 8) & 0x7f80) - 0x3f80;
-	object.texlod += raster->log_ram[raster->command_buffer[10] & 0x7fff];
-
-	/* determine whether we can cull this polygon */
-	cull = check_culling(raster,attr,min_z,max_z) || raster->build_tint == 1;   // (the build's: not on yet)
 
 	/* set the object's z value */
 	switch ((attr >> 10) & 3)
@@ -761,28 +734,54 @@ void model2_video::model2_3d_process_polygon(raster_state *raster, u32 attr)
 
 	raster->polygon_z = zvalue;
 
+	/* determine whether we can cull this polygon before touching texture_rom / log_ram */
+	cull = check_culling(raster, attr, min_z, max_z) || raster->build_tint == 1;
+
 	if (cull == false)
 	{
-		int32_t clipped_verts;
+		auto tpr = [&](u32 k) -> u16 { return tpa & 0x800000 ? raster->texture_ram[(tpa + k) & 0xffff] : raster->texture_rom[(tpa + k) & raster->texture_rom_mask]; };
+		object.v[0].pv = tpr(0);
+		object.v[0].pu = tpr(1);
+		object.v[1].pv = tpr(2);
+		object.v[1].pu = tpr(3);
+		object.v[2].pv = tpr(4);
+		object.v[2].pu = tpr(5);
+		if (NumVerts == 4)
+		{
+			object.v[3].pv = tpr(6);
+			object.v[3].pu = tpr(7);
+		}
+
+		auto thr = [&](u32 k) -> u16 { return tha & 0x800000 ? raster->texture_ram[(tha + k) & 0xffff] : raster->texture_rom[(tha + k) & raster->texture_rom_mask]; };
+		object.texheader[0] = thr(0);
+		object.texheader[1] = thr(1);
+		object.texheader[2] = thr(2);
+		object.texheader[3] = thr(3);
+
+		object.luma = (raster->command_buffer[9] >> 15) & 0xff;
+		object.texlod = ((raster->command_buffer[10] >> 8) & 0x7f80) - 0x3f80;
+		object.texlod += raster->log_ram[raster->command_buffer[10] & 0x7fff];
+
+		int32_t clipped_verts = NumVerts;
 		poly_vertex verts_in[8], verts_out[8];
-
-		for (int i = 0; i < NumVerts; i++)
-			verts_in[i] = object.v[i];
-
-		clipped_verts = NumVerts;
+		poly_vertex *vin = object.v;
+		poly_vertex *vout = verts_out;
 
 		// the free camera's near plane: what comes too close (behind the eye, or nearly at it, where the projection
 		// blows up) clipped off, and the polygon sorted by what's left of it
-		if (raster->fc_near > 0 && min_z < raster->fc_near) {
+		if (__builtin_expect(raster->fc_near > 0 && min_z < raster->fc_near, 0)) {
 			plane near_plane;
 			near_plane.normal.pz = 1.0f;
 			near_plane.distance = raster->fc_near;
-			clipped_verts = clip_polygon(verts_in, clipped_verts, verts_out, near_plane);
-			for (int j = 0; j < clipped_verts; j++)
-				verts_in[j] = verts_out[j];
+			const int32_t res = clip_polygon(vin, clipped_verts, vout, near_plane);
+			if (res >= 0) {
+				clipped_verts = res;
+				vin = verts_out;
+				vout = verts_in;
+			}
 			if (clipped_verts > 2 && ((attr >> 10) & 3) != 0 && ((attr >> 10) & 3) != 3) {
-				float lo = verts_in[0].pz, hi = verts_in[0].pz;
-				for (int j = 1; j < clipped_verts; j++) { lo = std::min(lo, verts_in[j].pz); hi = std::max(hi, verts_in[j].pz); }
+				float lo = vin[0].pz, hi = vin[0].pz;
+				for (int j = 1; j < clipped_verts; j++) { lo = std::min(lo, vin[j].pz); hi = std::max(hi, vin[j].pz); }
 				zvalue = raster->polygon_z = ((attr >> 10) & 3) == 1 ? lo : hi;
 			}
 		}
@@ -790,9 +789,16 @@ void model2_video::model2_3d_process_polygon(raster_state *raster, u32 attr)
 		/* do clipping */
 		for (int i = 0; i < 4; i++)
 		{
-			clipped_verts = clip_polygon(verts_in, clipped_verts, verts_out, raster->clip_plane[raster->center_sel][i]);
-			for (int j = 0; j < clipped_verts; j++)
-				verts_in[j] = verts_out[j];
+			const int32_t res = clip_polygon(vin, clipped_verts, vout, raster->clip_plane[raster->center_sel][i]);
+			if (res >= 0)
+			{
+				clipped_verts = res;
+				poly_vertex *next_out = (vin == verts_out) ? verts_out : verts_in;
+				vin = vout;
+				vout = next_out;
+				if (clipped_verts < 3)
+					break;
+			}
 		}
 
 		if (clipped_verts > 2 && raster->poly_list_index < MAX_POLYGONS - 1)   // (a full list: the polygon left out, not the process stopped (MAME's fatal error), as a display list from a snapshot's RAM can fill it)
@@ -800,10 +806,16 @@ void model2_video::model2_3d_process_polygon(raster_state *raster, u32 attr)
 			polygon *zpoly;
 
 			/* adjust and set the object z-sort value */
-			object.z = float_to_zval(side_sort_z(raster, m_ext, attr, zvalue, verts_out, clipped_verts, (object.texheader[0] >> 13 & 1) != 0), raster->z_adjust);
+			object.z = float_to_zval(side_sort_z(raster, m_ext, attr, zvalue, vin, clipped_verts, (object.texheader[0] >> 13 & 1) != 0), raster->z_adjust);
 
 			/* get our list read to add the polygons */
 			zpoly = raster->poly_sorted_list[object.z];
+			if (zpoly == nullptr)
+			{
+				const u32 z_idx = object.z >> 6;
+				raster->z_mask[z_idx] |= u64(1) << (object.z & 63);
+				raster->z_mask_l2[z_idx >> 6] |= u64(1) << (z_idx & 63);
+			}
 
 			/* go through the clipped vertex list, adding polygons */
 			polygon *poly = &raster->poly_list[raster->poly_list_index++];
@@ -835,7 +847,7 @@ void model2_video::model2_3d_process_polygon(raster_state *raster, u32 attr)
 			poly->num_vertices = clipped_verts;
 
 			for (int i = 0; i < clipped_verts; i++)
-				poly->v[i] = verts_out[i];
+				poly->v[i] = vin[i];
 
 			/* add to our sorted list */
 			raster->poly_sorted_list[object.z] = poly;
@@ -957,13 +969,15 @@ void model2_renderer::prepare(polygon *poly, const rectangle &cliprect, model2_v
 		for (int i = 0; i < poly->num_vertices; i++) out.v[i] = poly->v[i];   // (as a solid one's: not 1/z, u/z, v/z)
 	}
 
-	// the rows it can reach, for skipping the bands it can't (none if a position isn't a number)
-	out.miny = out.maxy = out.v[0].y;
-	for (int i = 0; i < poly->num_vertices; i++) {
-		const float y = out.v[i].y;
-		if (std::isnan(y) || std::isnan(out.v[i].x)) { out.miny = -INFINITY; out.maxy = INFINITY; break; }
-		out.miny = std::min(out.miny, y);
-		out.maxy = std::max(out.maxy, y);
+	if (!m_state.external_gpu()) {
+		// the rows it can reach, for skipping the bands it can't (none if a position isn't a number)
+		out.miny = out.maxy = out.v[0].y;
+		for (int i = 0; i < poly->num_vertices; i++) {
+			const float y = out.v[i].y;
+			if (std::isnan(y) || std::isnan(out.v[i].x)) { out.miny = -INFINITY; out.maxy = INFINITY; break; }
+			out.miny = std::min(out.miny, y);
+			out.maxy = std::max(out.maxy, y);
+		}
 	}
 }
 
@@ -1077,14 +1091,19 @@ void model2_video::export_picture(int picture, std::vector<gpu3d_poly> &out) con
 {
 	out.clear();
 	if (picture < 0 || picture > 3) return;
+	if (!m_pictures[picture].gpu_polys.empty()) {
+		out = m_pictures[picture].gpu_polys;
+		return;
+	}
 	export_list(m_pictures[picture].drawn, out);
 }
 
 void model2_video::export_list(const std::vector<drawn_poly> &list, std::vector<gpu3d_poly> &out) const
 {
-	out.reserve(list.size());
-	for (const drawn_poly &d : list) {
-		gpu3d_poly &g = out.emplace_back();
+	out.resize(list.size());
+	for (size_t idx = 0; idx < list.size(); ++idx) {
+		const drawn_poly &d = list[idx];
+		gpu3d_poly &g = out[idx];
 		g.n = d.num_vertices;
 		for (int i = 0; i < d.num_vertices; i++) { g.x[i] = d.v[i].x; g.y[i] = d.v[i].y; }
 		g.renderer = d.renderer;
@@ -1279,8 +1298,29 @@ void model2_video::render_frame_start(raster_state *raster)
 	/* reset the polygon list index */
 	raster->poly_list_index = 0;
 
-	/* reset the sorted z list */
-	std::fill(std::begin(raster->poly_sorted_list), std::end(raster->poly_sorted_list), nullptr);
+	/* reset only the occupied buckets in poly_sorted_list (avoid 512 KB memset every frame) */
+	for (int l2 = 0; l2 < 16; ++l2)
+	{
+		u64 m2 = raster->z_mask_l2[l2];
+		if (!m2)
+			continue;
+		raster->z_mask_l2[l2] = 0;
+		while (m2)
+		{
+			const int b2 = __builtin_ctzll(m2);
+			m2 &= m2 - 1;
+			const int idx = (l2 << 6) | b2;
+			u64 m1 = raster->z_mask[idx];
+			raster->z_mask[idx] = 0;
+			const int base = idx << 6;
+			while (m1)
+			{
+				const int b1 = __builtin_ctzll(m1);
+				m1 &= m1 - 1;
+				raster->poly_sorted_list[base | b1] = nullptr;
+			}
+		}
+	}
 
 	/* reset the min-max sortable Z values */
 	raster->min_z = 0xffff;
@@ -1321,10 +1361,16 @@ void model2_video::render_polygons()
 	int pic = 0;
 	if (m_delay)
 		while (pic == m_shown[1] || pic == m_shown[2]) pic++;
-	build_drawn(raster, m_pictures[pic].drawn);
-	m_pic_frame[pic] = m_parsed_frame;
 	static texdump *const dump = getenv("VF2_DUMP_TEXTURES") ? new texdump(getenv("VF2_DUMP_TEXTURES")) : nullptr;
-	if (dump) dump->add(m_pictures[pic].drawn, *this, m_parsed_frame);
+	if (m_external_gpu && !dump) {
+		m_pictures[pic].drawn.clear();
+		build_gpu_polys(raster, m_pictures[pic].gpu_polys);
+	} else {
+		m_pictures[pic].gpu_polys.clear();
+		build_drawn(raster, m_pictures[pic].drawn);
+		if (dump) dump->add(m_pictures[pic].drawn, *this, m_parsed_frame);
+	}
+	m_pic_frame[pic] = m_parsed_frame;
 	if (m_defer || m_external_gpu) m_pictures[pic].deferred = m_deferred = true;
 	else raster_drawn(pic);
 
@@ -1332,34 +1378,155 @@ void model2_video::render_polygons()
 	m_render_done = true;
 }
 
+void model2_video::build_gpu_polys(raster_state *raster, std::vector<gpu3d_poly> &out)
+{
+	const rectangle cliprect(0, 495 + 2 * m_ext, 0, 383);
+	const int xoffs = m_renderer->xoffs() + m_ext;
+	const int yoffs = m_renderer->yoffs();
+	out.clear();
+	out.reserve(raster->poly_list_index);
+	for (int window = raster->cur_window; window >= 0; window--)
+	{
+		for (int l2 = 0; l2 < 16; ++l2)
+		{
+			u64 m2 = raster->z_mask_l2[l2];
+			while (m2)
+			{
+				const int b2 = __builtin_ctzll(m2);
+				m2 &= m2 - 1;
+				const int idx = (l2 << 6) | b2;
+				u64 m1 = raster->z_mask[idx];
+				const int base = idx << 6;
+				while (m1)
+				{
+					const int b1 = __builtin_ctzll(m1);
+					m1 &= m1 - 1;
+					polygon *poly = raster->poly_sorted_list[base | b1];
+					while (poly != nullptr)
+					{
+						if (poly->window == window)
+						{
+							gpu3d_poly &g = out.emplace_back();
+							const int n = poly->num_vertices;
+							g.n = uint8_t(n);
+							const float cx = float(m_crtc_xoffset + m_ext) + poly->center[0];
+							const float cy = float(384 - poly->center[1] + m_crtc_yoffset);
+							u8 renderer = (poly->texheader[0] >> 13) & 3;
+							g.renderer = renderer;
+							g.checker = (poly->texheader[0] >> 15) & 1;
+
+							rectangle vp(poly->viewport[0] + xoffs, poly->viewport[2] + xoffs,
+										 (384 - poly->viewport[3]) + yoffs, (384 - poly->viewport[1]) + yoffs);
+							vp &= cliprect;
+							g.vp[0] = int16_t(vp.min_x);
+							g.vp[1] = int16_t(vp.max_x);
+							g.vp[2] = int16_t(vp.min_y);
+							g.vp[3] = int16_t(vp.max_y);
+
+							const u32 lumabase = (poly->texheader[1] & 0xff) << 7;
+							const u32 colorbase = (poly->texheader[3] >> 6) & 0x3ff;
+							u16 luma = poly->luma;
+							u16 pal = 0;
+
+							if (poly->hue >= 0 && (poly->texheader[1] & 0xff) == 0 && (renderer & 2)) {
+								const u32 hc = hair_colour(u16(m_palram[colorbase + 0x1000] & 0x7fff), poly->hue);
+								pal = u16(hc);
+								if (hc >> 16) luma = u16(std::min<u32>(u32(luma) * (hc >> 16) / 16, 0xffff));
+							}
+
+							if (poly->build >= 2) {
+								for (int i = 0; i < n; i++) {
+									const float ooz = 1.0f / (poly->v[i].pz + std::numeric_limits<float>::min());
+									g.x[i] = cx + (poly->v[i].x * ooz);
+									g.y[i] = cy - (poly->v[i].y * ooz);
+								}
+								const u32 v = poly->build == 2 ? 255u : 64u + (u32(poly->luma) * 9 >> 4);
+								g.renderer = 0;
+								g.checker = 0;
+								g.colour = rgb_t(v, v, poly->build == 2 ? 255u : (v + 6 > 255 ? 255u : v + 6)) | 0xff000000u;
+							} else if (!(renderer & 2)) {
+								for (int i = 0; i < n; i++) {
+									const float ooz = 1.0f / (poly->v[i].pz + std::numeric_limits<float>::min());
+									g.x[i] = cx + (poly->v[i].x * ooz);
+									g.y[i] = cy - (poly->v[i].y * ooz);
+								}
+								const u32 c = pal ? pal & 0x7fff : m_palram[colorbase + 0x1000] & 0xffff;
+								const u32 l = luma >> 2;
+								const u32 r = m_colorxlat[0x0000 / 2 + (((c >> 0) & 0x1f) << 8) + l] & 0xff;
+								const u32 gg = m_colorxlat[0x4000 / 2 + (((c >> 5) & 0x1f) << 8) + l] & 0xff;
+								const u32 b = m_colorxlat[0x8000 / 2 + (((c >> 10) & 0x1f) << 8) + l] & 0xff;
+								g.colour = rgb_t(m_gamma_table[r], m_gamma_table[gg], m_gamma_table[b]);
+							} else {
+								for (int i = 0; i < n; i++) {
+									const float ooz = 1.0f / (poly->v[i].pz + std::numeric_limits<float>::min());
+									g.x[i] = cx + (poly->v[i].x * ooz);
+									g.y[i] = cy - (poly->v[i].y * ooz);
+									g.z[i] = ooz;
+									g.u[i] = poly->v[i].pu * ooz * (1.0f / 8.0f);
+									g.v[i] = poly->v[i].pv * ooz * (1.0f / 8.0f);
+								}
+								g.pal = pal ? u16(pal & 0x7fff) : u16(m_palram[colorbase + 0x1000] & 0x7fff);
+								g.lumabase = u16(lumabase);
+								g.luma = luma;
+								g.texlod = poly->texlod;
+								g.sheet = ((poly->texheader[2] & 0x1000) != 0);
+								g.texw = u16(32 << ((poly->texheader[0] >> 0) & 0x7));
+								g.texh = u16(32 << ((poly->texheader[0] >> 3) & 0x7));
+								g.texx = u16(32 * ((poly->texheader[2] >> 0) & 0x3f));
+								g.texy = u16(32 * ((poly->texheader[2] >> 6) & 0x1f));
+								g.mirrorx = (poly->texheader[0] >> 8) & 1;
+								g.mirrory = (poly->texheader[0] >> 9) & 1;
+								g.wrapx = (poly->texheader[0] >> 6) & 1 & ~g.mirrorx;
+								g.wrapy = (poly->texheader[0] >> 7) & 1 & ~g.mirrory;
+								g.utex = (poly->texheader[0] >> 12) & 1;
+								g.utexminlod = (poly->texheader[0] >> 10) & 3;
+								g.utexx = u16(((poly->texheader[2] >> 13) & 1) * 128);
+								g.utexy = u16(((poly->texheader[2] >> 14) & 3) * 128);
+							}
+						}
+						poly = (polygon *)poly->next;
+					}
+				}
+			}
+		}
+	}
+}
+
 // A raster's sorted polygons projected and set up for drawing, in MAME's order
 void model2_video::build_drawn(raster_state *raster, std::vector<drawn_poly> &drawn)
 {
-	int32_t z;
 	const rectangle cliprect(0, 495 + 2 * m_ext, 0, 383);   // prepare() clips the viewports in arcade pixels
 	drawn.clear();
+	drawn.reserve(raster->poly_list_index);
 	for (int window = raster->cur_window; window >= 0; window--)
 	{
-		/* go through the Z levels, and render each bucket */
-		for (z = raster->min_z; z <= raster->max_z; z++)
+		/* go through only occupied Z levels via the 2-level bitmask, in ascending z order */
+		for (int l2 = 0; l2 < 16; ++l2)
 		{
-			/* see if we have items at this z level */
-			if (raster->poly_sorted_list[z] != nullptr)
+			u64 m2 = raster->z_mask_l2[l2];
+			while (m2)
 			{
-				/* get a pointer to the first polygon */
-				polygon *poly = raster->poly_sorted_list[z];
-
-				/* and loop clipping and rendering each polygon */
-				while (poly != nullptr)
+				const int b2 = __builtin_ctzll(m2);
+				m2 &= m2 - 1;
+				const int idx = (l2 << 6) | b2;
+				u64 m1 = raster->z_mask[idx];
+				const int base = idx << 6;
+				while (m1)
 				{
-					if (poly->window == window)
+					const int b1 = __builtin_ctzll(m1);
+					m1 &= m1 - 1;
+					polygon *poly = raster->poly_sorted_list[base | b1];
+					while (poly != nullptr)
 					{
-						/* project and render */
-						model2_3d_project(poly);
-						m_renderer->prepare(poly, cliprect, drawn.emplace_back());
-					}
+						if (poly->window == window)
+						{
+							/* project and render */
+							model2_3d_project(poly);
+							m_renderer->prepare(poly, cliprect, drawn.emplace_back());
+						}
 
-					poly = (polygon *)poly->next;
+						poly = (polygon *)poly->next;
+					}
 				}
 			}
 		}
@@ -1419,12 +1586,39 @@ void model2_video::draw_framebuffer(bitmap_rgb32 &bitmap, const rectangle &scree
 }
 
 /* 3D Rasterizer main data input port */
-void model2_video::model2_3d_push(raster_state *raster, u32 input)
+inline void model2_video::model2_3d_push(raster_state *raster, u32 input)
 {
 	/* see if we have a command in progress */
 	if (raster->cur_command != 0)
 	{
-		raster->command_buffer[raster->command_index++] = input;
+		const u32 idx = raster->command_index++;
+		raster->command_buffer[idx] = input;
+		if (raster->cur_command == 0x01)
+		{
+			if (idx < 8)
+				return;
+			const u32 attr = raster->command_buffer[8];
+			if ((attr & 3) == 0)
+			{
+				raster->cur_command = 0;
+				return;
+			}
+			if (attr & 1)
+			{
+				if (idx < 16)
+					return;
+				model2_3d_process_polygon<4>(raster, attr);
+				raster->command_index = 8;
+			}
+			else
+			{
+				if (idx < 13)
+					return;
+				model2_3d_process_polygon<3>(raster, attr);
+				raster->command_index = 8;
+			}
+			return;
+		}
 
 		switch (raster->cur_command)
 		{
@@ -1432,49 +1626,6 @@ void model2_video::model2_3d_push(raster_state *raster, u32 input)
 			break;
 
 			case 0x01:  /* Polygon Data */
-			{
-				u32  attr;
-
-				/* start by looking if we have the basic input data */
-				if (raster->command_index < 9)
-					return;
-
-				/* get the attributes */
-				attr = raster->command_buffer[8];
-
-				/* see if we're done */
-				if ((attr & 3) == 0)
-				{
-					raster->cur_command = 0;
-					return;
-				}
-
-				/* see if it's a quad or a triangle */
-				if (attr & 1)
-				{
-					/* it's a quad, wait for the rest of the points */
-					if (raster->command_index < 17)
-						return;
-
-					/* we have a full polygon info, fill up our polygon structure */
-					model2_3d_process_polygon<4>(raster, attr);
-
-					/* back up and wait for more data */
-					raster->command_index = 8;
-				}
-				else
-				{
-					/* it's a triangle, wait for the rest of the point */
-					if (raster->command_index < 14)
-						return;
-
-					/* we have a full polygon info, fill up our polygon structure */
-					model2_3d_process_polygon<3>(raster, attr);
-
-					/* back up and wait for more data */
-					raster->command_index = 8;
-				}
-			}
 			break;
 
 			case 0x03:  /* Window Data */

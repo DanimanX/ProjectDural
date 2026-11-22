@@ -66,11 +66,15 @@ void SCSPDSP::Init()
 
 void SCSPDSP::DecodeSteps()
 {
-	for (int step = 0; step < 128; ++step)
+	m_active_count = 0;
+	const int limit = std::clamp(LastStep, 0, 128);
+	for (int step = 0; step < limit; ++step)
 	{
 		const u16 *const IPtr = MPRO + (step * 4);
-		DecodedStep &d = m_decoded[step];
-		d.nop   = (!IPtr[0] && !IPtr[1] && !IPtr[2] && !IPtr[3]);
+		if (!IPtr[0] && !IPtr[1] && !IPtr[2] && !IPtr[3])
+			continue;
+		DecodedStep &d = m_decoded[m_active_count++];
+		d.nop   = false;
 		d.TRA   = (IPtr[0] >>  8) & 0x7f;
 		d.TWT   = (IPtr[0] >>  7) & 0x01;
 		d.TWA   = (IPtr[0] >>  0) & 0x7f;
@@ -96,6 +100,8 @@ void SCSPDSP::DecodeSteps()
 		d.MASA  = (IPtr[3] >>  2) & 0x1f;
 		d.ADREB = (IPtr[3] >>  1) & 0x01;
 		d.NXADR = (IPtr[3] >>  0) & 0x01;
+		d.odd_mrd = u8(d.MRD && (step & 1));
+		d.odd_mwt = u8(d.MWT && (step & 1));
 	}
 	m_dirty = false;
 }
@@ -122,11 +128,9 @@ void SCSPDSP::Step()
 	s32 Y_REG = 0;      //24 bit
 	u32 ADRS_REG = 0;  //13 bit
 
-	for (int step = 0; step < /*128*/LastStep; ++step)
+	for (int idx = 0; idx < m_active_count; ++idx)
 	{
-		const DecodedStep &d = m_decoded[step];
-		if (d.nop)
-			continue;
+		const DecodedStep &d = m_decoded[idx];
 
 		u32 const TRA   = d.TRA;
 		u32 const TWT   = d.TWT;
@@ -139,8 +143,6 @@ void SCSPDSP::Step()
 		u32 const IWA   = d.IWA;
 
 		u32 const TABLE = d.TABLE;
-		u32 const MWT   = d.MWT;
-		u32 const MRD   = d.MRD;
 		u32 const EWT   = d.EWT;
 		u32 const EWA   = d.EWA;
 		u32 const ADRL  = d.ADRL;
@@ -270,8 +272,7 @@ void SCSPDSP::Step()
 				FRC_REG = (SHIFTED >> 11) & 0x1fff;
 		}
 
-		if (MRD || MWT)
-		//if (0)
+		if (d.odd_mrd || d.odd_mwt)
 		{
 			u32 ADDR = MADRS[MASA];
 			if (!TABLE)
@@ -286,14 +287,14 @@ void SCSPDSP::Step()
 				ADDR &= 0xffff;
 			ADDR += RBP << 12;
 			ADDR <<= 1;
-			if (MRD && (step & 1)) //memory only allowed on odd? DoA inserts NOPs on even
+			if (d.odd_mrd)
 			{
 				if (NOFL)
 					MEMVAL = read_word(ADDR) << 8;
 				else
 					MEMVAL = UNPACK(read_word(ADDR));
 			}
-			if (MWT && (step & 1))
+			if (d.odd_mwt)
 			{
 				if (NOFL)
 					write_word(ADDR, SHIFTED >> 8);
@@ -338,4 +339,5 @@ void SCSPDSP::Start()
 			break;
 	}
 	LastStep = i + 1;
+	m_dirty = true;
 }

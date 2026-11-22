@@ -41,9 +41,9 @@ if [ ! -f "$BDIR/libz.a" ]; then
     "$ZIG_BIN" ar rcs "$BDIR/libz.a" "$BDIR/zlib"/*.o
 fi
 
-"$ZIG_BIN" cc -O2 -w -DSLJIT_CONFIG_AUTO=1 -c third_party/sljit/sljitLir.c -o "$BDIR/sljitLir.o"
+"$ZIG_BIN" cc -O3 -w -DSLJIT_CONFIG_AUTO=1 -c third_party/sljit/sljitLir.c -o "$BDIR/sljitLir.o"
 
-CXX_FLAGS="-std=c++20 -O2 -fno-fast-math -ffp-contract=off \
+CXX_FLAGS="-std=c++20 -O3 -fno-fast-math -fno-math-errno -ffp-contract=off \
   -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare -Wno-unused-but-set-variable -Wno-unused-variable -Wno-unused-function -Wno-attributes \
   -Isrc/core/shim_include -Isrc -Iplatform/arm64 -I$ZLIB_DIR -I$EXTERN/imgui -I$SDL_INC -I$SDL_INC/SDL2"
 
@@ -61,7 +61,10 @@ RT_SRCS=(
 printf '%s\n' "${RT_SRCS[@]}" | xargs -P "$JOBS" -I{} sh -c '
     src="$1"; tag=$(echo "$src" | tr "/." "__"); out="$2/${tag}.o"
     extra=""
-    case "$src" in third_party/*|src/host/stb_image_impl.cpp) extra="-w" ;; esac
+    case "$src" in
+        third_party/*|src/host/stb_image_impl.cpp) extra="-w -O3 -fno-math-errno" ;;
+        src/machine/model2_video.cpp|src/machine/model2_smooth.cpp) extra="-O3 -fno-math-errno -ffp-contract=fast" ;;
+    esac
     exec "$3" c++ '"$CXX_FLAGS"' $extra -c "$src" -o "$out"
 ' _ {} "$BDIR/rt" "$ZIG_BIN"
 rm -f "$BDIR/libruntime.a"
@@ -75,7 +78,7 @@ rm -f "$BDIR/libimgui.a"
 "$ZIG_BIN" ar rcs "$BDIR/libimgui.a" "$BDIR/ui"/*.o
 
 for f in platform/arm64/gpu_gles.cpp platform/arm64/main_arm64.cpp; do
-    "$ZIG_BIN" c++ $CXX_FLAGS -c "$f" -o "$BDIR/obj/$(basename "$f" .cpp).o"
+    "$ZIG_BIN" c++ $CXX_FLAGS -ffp-contract=fast -c "$f" -o "$BDIR/obj/$(basename "$f" .cpp).o"
 done
 
 # Link with system SDL2 if available, else generate link-time stub for headless bench

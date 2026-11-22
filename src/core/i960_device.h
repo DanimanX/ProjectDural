@@ -86,6 +86,7 @@ public:
 	uint64_t run_ns = 0, runs = 0;
 
 	bool stopped() const { return m_stopped; }   // (an instruction it couldn't run: it runs nothing till a reset or a load)
+	void force_stop() { m_stopped = true; m_icount = 0; }
 	void device_reset() override { m_stopped = false; i80960kb_device::device_reset(); }
 
 protected:

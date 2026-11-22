@@ -49,10 +49,29 @@ public:
         snd_->set_volumes(music_vol_, sfx_vol_);
         stop_ = false;
         busy_ = false;
+        in_flight_ = false;
+        paused_ = false;
         pending_reset_ = false;
         queued_bytes_.clear();
         thread_ = std::thread(&SoundWorker::loop, this);
         return true;
+    }
+
+    void push_uart(const uint8_t *data, size_t n) {
+        if (!snd_ || !data || !n) return;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            queued_bytes_.insert(queued_bytes_.end(), data, data + n);
+        }
+        cv_.notify_one();
+    }
+
+    void set_paused(bool paused) {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            paused_ = paused;
+        }
+        cv_.notify_one();
     }
 
     void submit(std::vector<uint8_t> uart_bytes) {
@@ -70,13 +89,14 @@ public:
     void wait() {
         if (!thread_.joinable()) return;
         std::unique_lock<std::mutex> lk(mu_);
-        done_.wait(lk, [&] { return !busy_; });
+        done_.wait(lk, [&] { return !busy_ && !in_flight_; });
     }
 
     void reset() {
         if (!snd_) return;
-        wait();
-        std::lock_guard<std::mutex> lk(mu_);
+        std::unique_lock<std::mutex> lk(mu_);
+        busy_ = false;
+        done_.wait(lk, [&] { return !in_flight_; });
         queued_bytes_.clear();
         snd_->reset();
         snd_->scsp().set_dsp_enabled(dsp_enabled_);
@@ -126,8 +146,18 @@ private:
             bool dsp = true;
             {
                 std::unique_lock<std::mutex> lk(mu_);
-                cv_.wait(lk, [&] { return stop_ || busy_; });
-                if (stop_) return;
+                if (audio_) {
+                    for (;;) {
+                        if (stop_) return;
+                        const bool need_audio = !paused_ && (audio_->queued_frames() < AudioRate::kTargetFrames + 768);
+                        if (busy_ || need_audio) break;
+                        cv_.wait_for(lk, std::chrono::milliseconds(2));
+                    }
+                } else {
+                    cv_.wait(lk, [&] { return stop_ || busy_; });
+                    if (stop_) return;
+                }
+                in_flight_ = true;
                 bytes.swap(queued_bytes_);
                 do_vol = pending_vol_; pending_vol_ = false;
                 do_dsp = pending_dsp_; pending_dsp_ = false;
@@ -149,6 +179,7 @@ private:
             {
                 std::lock_guard<std::mutex> lk(mu_);
                 busy_ = false;
+                in_flight_ = false;
             }
             done_.notify_all();
         }
@@ -163,6 +194,8 @@ private:
     std::vector<uint8_t> queued_bytes_;
     bool stop_ = false;
     bool busy_ = false;
+    bool in_flight_ = false;
+    bool paused_ = false;
     bool pending_reset_ = false;
     bool pending_vol_ = false;
     bool pending_dsp_ = false;

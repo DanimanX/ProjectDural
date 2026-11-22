@@ -1,6 +1,7 @@
 // Small stand-ins for the MAME framework types the ported video files use.
 #pragma once
 #include "../core/mame_shim.h"
+#include <cstring>
 #include <memory>
 #include <vector>
 
@@ -41,6 +42,17 @@ public:
 	rectangle cliprect() const { return rectangle(0, m_w - 1, 0, m_h - 1); }
 	void fill(uint32_t c, const rectangle &r)
 	{
+		if (r.min_y > r.max_y || r.min_x > r.max_x) return;
+		if (c == 0) {
+			const size_t w = size_t(r.max_x - r.min_x + 1);
+			if (r.min_x == 0 && r.max_x == m_w - 1 && m_row == size_t(m_w)) {
+				std::memset(&pix(r.min_y, 0), 0, size_t(r.max_y - r.min_y + 1) * m_row * sizeof(uint32_t));
+			} else {
+				for (int y = r.min_y; y <= r.max_y; y++)
+					std::memset(&pix(y, r.min_x), 0, w * sizeof(uint32_t));
+			}
+			return;
+		}
 		for (int y = r.min_y; y <= r.max_y; y++)
 			std::fill(&pix(y, r.min_x), &pix(y, r.max_x) + 1, c);
 	}

@@ -100,7 +100,9 @@ private:
         uint32_t texture = 0;
         uint32_t w = 1, h = 1;
         bool transparent = false;
+        bool stale = false;
         size_t bytes = 0;
+        uint64_t hash = 0;
     };
 
     static constexpr size_t kSourceCacheBytes = 24u * 1024u * 1024u;
@@ -108,17 +110,28 @@ private:
     static constexpr uint32_t kPaletteWidth = 128;
     static constexpr uint32_t kPaletteRows = 2048;
 
+    struct LayerTex2D {
+        uint32_t tex[2] = {0, 0};
+        uint32_t cur = 0;
+        int w = 0, h = 0;
+        bool linear = false;
+        std::vector<uint16_t> shadow[2];
+        uint32_t active() const { return tex[cur]; }
+    };
+
     uint32_t make_texture(uint32_t w, uint32_t h, bool linear, uint32_t wrap_s, uint32_t wrap_t,
                           uint32_t format, const void *pixels);
     void update_texture_rgba(uint32_t &tex, int &cur_w, int &cur_h, int w, int h, bool linear,
                              const uint32_t *argb, size_t stride_px);
-    void update_texture_2d_rgb565(uint32_t &tex, int &cur_w, int &cur_h, int w, int h, bool linear,
-                                  const uint32_t *argb, size_t stride_px, std::vector<uint16_t> &shadow);
-    void update_texture_2d_rgba5551(uint32_t &tex, int &cur_w, int &cur_h, int w, int h, bool linear,
-                                    const uint32_t *argb, size_t stride_px, std::vector<uint16_t> &shadow);
+    void update_texture_2d_rgb565(LayerTex2D &layer, int w, int h, bool linear,
+                                  const uint32_t *argb, size_t stride_px);
+    void update_texture_2d_rgba5551(LayerTex2D &layer, int w, int h, bool linear,
+                                    const uint32_t *argb, size_t stride_px,
+                                    int y_active0, int y_active1, int &prev_y0, int &prev_y1);
     const TexSource *source_for(const gpu3d_poly &poly, const gpu3d_rams &rams);
     int palette_row(const gpu3d_poly &poly, const gpu3d_rams &rams);
     void clear_tex_cache();
+    void clear_tex_sheet(uint32_t sheet);
     void clear_pal_cache();
     void flush_palette_gl();
     void emit_3d_polys(const gpu3d_poly *polys, size_t count, const gpu3d_rams &rams,
@@ -127,14 +140,17 @@ private:
     bool ok_ = false;
     bool shutdown_ = false;
 
-    // 2D Layer textures
-    uint32_t tex_bd_ = 0, tex_mid_ = 0, tex_top_ = 0, tex_cpu3d_ = 0, tex_sides_ = 0;
-    int bd_w_ = 0, bd_h_ = 0;
-    int mid_w_ = 0, mid_h_ = 0;
-    int top_w_ = 0, top_h_ = 0;
+    // 2D Layer textures (double-buffered to avoid Mali-G31 texture modification pipeline stalls)
+    LayerTex2D layer_bd_, layer_mid_, layer_top_;
+    uint32_t tex_cpu3d_ = 0, tex_sides_ = 0;
     int cpu3d_w_ = 0, cpu3d_h_ = 0;
     int sides_w_ = 0, sides_h_ = 0;
     uint64_t last_2d_version_ = UINT64_MAX;
+    uint64_t last_sides_version_ = UINT64_MAX;
+    int prev_mid_y0_ = 0, prev_mid_y1_ = 384;
+    int prev_top_y0_ = 0, prev_top_y1_ = 384;
+    int draw_mid_y0_ = 0, draw_mid_y1_ = 0;
+    int draw_top_y0_ = 0, draw_top_y1_ = 0;
     bool mid_empty_ = true, top_empty_ = true;
 
     // 3D Texture cache
@@ -143,9 +159,9 @@ private:
     size_t cached_bytes_ = 0;
     uint32_t last_tex_gen_[2] = {UINT32_MAX, UINT32_MAX};
 
-    // 3D Palette LUT cache (128 x 2048 RGBA)
+    // 3D Palette LUT cache (128 x 2048 RGB565)
     uint32_t palette_texture_ = 0;
-    std::vector<uint32_t> palette_shadow_;
+    std::vector<uint16_t> palette_shadow_;
     std::unordered_map<uint64_t, uint32_t> palette_index_;
     uint32_t palette_used_ = 0;
     uint32_t palette_dirty_begin_ = UINT32_MAX;
@@ -156,7 +172,6 @@ private:
     bool have_gamma_ = false;
 
     std::vector<uint32_t> swizzle_scratch_;
-    std::vector<uint16_t> bd_shadow_, mid_shadow_, top_shadow_;
     size_t last_poly_count_ = 0;
     size_t last_batch_count_ = 0;
     uint32_t last_tex_clears_ = 0;

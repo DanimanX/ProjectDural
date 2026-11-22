@@ -95,6 +95,7 @@ public:
 	// drawn at once.)
 	void render_async(u32 *out, size_t stride);
 	void render_wait();
+	void set_ext_render_wait(std::function<void()> fn) { m_ext_render_wait = std::move(fn); }
 	// The same picture in parts, for the host to put together on the GPU: the 2D at the arcade's
 	// resolution, each of its pixels to go up as an s x s block (nearest sampling), and the 3D at
 	// the render scale. In order, each over the last:
@@ -133,6 +134,8 @@ public:
 		bool gpu3d = false;   // the 3D drawn by the host's gpu3d (has3d: something to show), not in px3d
 		bool bd_unpadded = false; // backdrop points directly to m_sys24 (width w, no PAD border)
 		u32 pen0 = 0;         // background pen 0 colour
+		int mid_y0 = 0, mid_y1 = HEIGHT; // active non-empty row span in mid [mid_y0, mid_y1)
+		int top_y0 = 0, top_y1 = HEIGHT; // active non-empty row span in top [top_y0, top_y1)
 	};
 	// The 3D on the GPU (the host's, src/gpu/gpu3d.h): given `gpu`, the 3D isn't drawn on the CPU
 	// but handed over: gpu(video, picture) with the RAMs as that picture's frame left them (its
@@ -447,7 +450,7 @@ public:
 	std::vector<int16_t> m_audio_out;
 	// The sound board running (68000, SCSP, the link both ways), or held halted as in the MAME
 	// reference runs for the CPU/video regression (the default). Takes effect at reset().
-	void set_sound(bool on) { m_sound_on = on; }
+	void set_sound(bool on) { m_sound_on = on; if (!on) timer_disable(T_SOUND_UPDATE); }
 	bool sound() const { return m_sound_on; }
 	// A board for its sound alone (online play's: the match's board runs with its sound held, the same on both
 	// sides, and this one plays what it sends): only the 68000 and the SCSP run (the i960, the TGP and the Z80
@@ -648,6 +651,13 @@ private:
 	// 2D video
 	std::array<uint32_t, 8192> m_pens{};
 	bool m_palette_dirty = false;
+	uint64_t m_pal2d_version = 1;
+	int m_mid_y0 = 0, m_mid_y1 = HEIGHT;
+	int m_top_y0 = 0, m_top_y1 = HEIGHT;
+	bool m_2d_cache_valid = false;
+	bool m_2d_bg_valid = false;
+	uint64_t m_2d_cache_key[12]{};
+	uint64_t m_2d_bg_key[8]{};
 	u8 m_gamma[256];
 	// the screen; the tile layers: the backdrop (maps 2 and 3, opaque), the layers over it under the
 	// 3D, the layers over the 3D
@@ -703,7 +713,8 @@ private:
 	std::vector<ram_change> m_ram_log;   // the last frames' changes, oldest first
 	void ram_log_apply(uint64_t frame, bool undo);
 	bool m_job_reverts = false;          // the picture being drawn has those RAMs taken back: nothing may touch them
-	void ram_guard() { if (m_job_reverts) render_wait(); }
+	void ram_guard() { if (m_job_reverts || m_ext_render_wait) render_wait(); }
+	std::function<void()> m_ext_render_wait;
 	std::unique_ptr<background_job> m_job;   // render_async's
 	work_stats m_stats;
 	double m_moment3d = -1;

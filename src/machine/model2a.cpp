@@ -27,7 +27,10 @@ struct model2a::tgp_bus : mb86233_bus
 	u32 sincos_base = 0, inv_base = 0, isqrt_base = 0, atan_base[4]{};
 	const u32 *tables;   // copro_tgp_tables as 32-bit words
 
-	explicit tgp_bus(model2a &mm) : m(mm), tables(reinterpret_cast<const u32 *>(mm.m_roms.regions[romset::COPRO_TABLES].data())) {}
+	explicit tgp_bus(model2a &mm) : m(mm), tables(reinterpret_cast<const u32 *>(mm.m_roms.regions[romset::COPRO_TABLES].data()))
+	{
+		cpu.set_fast_mem(prog, ram0, ram1);
+	}
 
 	u32 prog_r(u32 a) override { return prog[a & 0xfff]; }
 
@@ -172,6 +175,7 @@ model2a::model2a(romset::result &&roms, bool recompile)
 	m_ram200.assign(0x40000, 0);
 	m_workram.assign(0x100000, 0);
 	m_bufferram.assign(0x20000, 0);
+	m_tgp->cpu.set_fast_mem(m_tgp->prog, m_tgp->ram0, m_tgp->ram1, m_bufferram.data(), &m_tgp->bank_reg);
 	m_backup.assign(0x4000, 0xff);     // NVRAM DEFAULT_ALL_1 (a never-saved board)
 	m_cpuctl.assign(0x38, 0);
 	m_palram.assign(0x2000, 0);
@@ -623,6 +627,11 @@ uint64_t model2a::tgp_now() const
 void model2a::reset()
 {
 	render_wait();
+	m_2d_cache_valid = false;
+	m_2d_bg_valid = false;
+	m_pal2d_version++;
+	m_mid_y0 = 0; m_mid_y1 = HEIGHT;
+	m_top_y0 = 0; m_top_y1 = HEIGHT;
 	m_snd_queue.clear();
 	m_snd_next = 0;
 	m_cur_2d.reset();   // (what was kept for drawing pictures again belongs to the run before)
@@ -705,6 +714,11 @@ void model2a::power_on()
 	m_tiles.mark_dirty();
 	m_pens.fill(0xff000000);
 	m_palette_dirty = true;
+	m_2d_cache_valid = false;
+	m_2d_bg_valid = false;
+	m_pal2d_version++;
+	m_mid_y0 = 0; m_mid_y1 = HEIGHT;
+	m_top_y0 = 0; m_top_y1 = HEIGHT;
 	for (int k = 0; k < 4; k++) m_video->note_ram(k);
 	m_eeprom = eeprom93c46{};
 	std::fill(std::begin(m_eeprom.cells), std::end(m_eeprom.cells), 0xffff);
@@ -992,7 +1006,11 @@ bool model2a::load_state(const uint8_t *p, size_t n)
 	}
 	m2::StateReader rd(p + fixed, n - fixed);
 	state(rd);
+	m_tgp->cpu.mark_prog_dirty();
 	m_head = -1;
+	m_2d_cache_valid = false;
+	m_2d_bg_valid = false;
+	m_pal2d_version++;
 	// the geometrizer and rasterizer as they were at the save (kept by this board), not as the frames since left them
 	if (since) m_video->restore_geo(uint64_t(h.epoch) << 32 | h.gen);
 	// smooth motion's record of the 3D's RAMs changing: the frames from the one restored on are to run again
@@ -1090,9 +1108,9 @@ void model2a::set_input_line(int line, int state)
 
 void model2a::apply_line(int line)
 {
-	std::vector<int> q;
-	q.swap(m_line_queue[line]);
-	for (int state : q) {
+	std::vector<int> &q = m_line_queue[line];
+	for (size_t i = 0; i < q.size(); ++i) {
+		const int state = q[i];
 		switch (line) {
 		case L_IRQ0: case L_IRQ1: case L_IRQ2: case L_IRQ3:
 			m_cpu.set_input_line(line - L_IRQ0, state);
@@ -1125,6 +1143,7 @@ void model2a::apply_line(int line)
 			break;
 		}
 	}
+	q.clear();
 }
 
 void model2a::suspend(int cpu, u32 reason)
@@ -1318,7 +1337,24 @@ void model2a::run_frame()
 		write_dword(0x508000, read_dword(0x508000) | 0x4000);
 		m_sw = u8(m_sw & ~1);
 	}
-	while (m_frame_number == f) timeslice();
+	if (!g_mame_trap) {
+		jmp_buf trap;
+		g_mame_trap = &trap;
+		if (!setjmp(trap)) {
+			while (m_frame_number == f) timeslice();
+		} else {
+			m_cpu.force_stop();
+			g_mame_trap = &trap;
+			if (!setjmp(trap)) {
+				while (m_frame_number == f) timeslice();
+			} else {
+				m_cpu.force_stop();
+			}
+		}
+		g_mame_trap = nullptr;
+	} else {
+		while (m_frame_number == f) timeslice();
+	}
 	m_in1 = in_were[0]; m_in2 = in_were[1]; m_sw = sw_was;
 	take_audio();
 	m_scroll_hist[f % SCROLL_HIST] = { int64_t(f), m_tiles.tile_r(0x5002), m_tiles.tile_r(0x5006) };   // (smooth motion's backdrop)
@@ -1835,6 +1871,7 @@ void model2a::copro_fifo_w(u32 data)
 {
 	if (m_coproctl & 0x80000000) {
 		m_tgp->prog[m_coprocnt & 0xfff] = data;
+		m_tgp->cpu.mark_prog_dirty();
 		m_coprocnt++;
 	} else
 		fifo_push(false, data);
@@ -1868,6 +1905,7 @@ void model2a::palette_w(offs_t offset, u16 data, u16 mem_mask)
 	const u16 v = (m_palram[offset] & ~mem_mask) | (data & mem_mask);
 	if (v == m_palram[offset]) return;   // (the same value: the pen is as it was; a picture being drawn may be reading it)
 	if (offset >= 0x1000) before_3d_ram_change(RAM_PAL, offset, m_palram[offset], v);   // (the polygons' colours)
+	else m_pal2d_version++;
 	touch(P_PAL, offset * 2);
 	m_palram[offset] = v;
 	set_pen(int(offset));
@@ -2010,6 +2048,9 @@ void model2a::bd_pixels(int mode, double dh, double dv, int &dx, int &dy) const
 
 void model2a::render_wait()
 {
+	if (m_ext_render_wait) {
+		m_ext_render_wait();
+	}
 	if (!m_job_active) return;
 	const auto t0 = std::chrono::steady_clock::now();
 	m_job->wait();
@@ -2126,6 +2167,9 @@ void model2a::swap_2d(frame_2d &f)
 	f.char_ram = chars;
 	m_tiles.mark_dirty();
 	m_palette_dirty = true;
+	m_2d_cache_valid = false;
+	m_2d_bg_valid = false;
+	m_pal2d_version++;
 }
 
 // The picture `pic` again, at the scale and width now, from what was kept: nothing of the game
@@ -2145,6 +2189,7 @@ void model2a::redraw_into(const picture_desc &pic, u32 *out, size_t stride)
 	freecam_sky_move();
 	draw_2d(pic.polygons, false);
 	m_2d_key[0] = ~0ull;
+	m_2d_cache_valid = false;
 	const u32 pen0 = m_pens[0];
 	if (!live) swap_2d(st);   // (the live state back; its colours are worked out again at the next picture)
 	const bool wide = m_2d_wide, smooth = m_2d_filter;
@@ -2233,6 +2278,8 @@ void model2a::draw_picture(u32 *out, size_t stride, bool polygons, bool async, f
 		parts->filter = smooth;
 		parts->bdx = bdx; parts->bdy = bdy;
 		parts->pen0 = m_pens[0];
+		parts->mid_y0 = m_mid_y0; parts->mid_y1 = m_mid_y1;
+		parts->top_y0 = m_top_y0; parts->top_y1 = m_top_y1;
 		parts->sides = 0;
 		parts->side_px = nullptr;
 	}
@@ -2415,42 +2462,107 @@ void model2a::draw_picture(u32 *out, size_t stride, bool polygons, bool async, f
 // filter the backdrop softened too; for render_parts the backdrop padded.
 void model2a::draw_2d(bool polygons, bool parts)
 {
-	if (m_palette_dirty)
+	if (m_palette_dirty) {
 		for (int i = 0; i < 0x1000; i++) set_pen(i);
+		m_palette_dirty = false;
+		m_pal2d_version++;
+	}
 	const int s = m_scale, e = m_ext, w = WIDTH + 2 * e;
 	const bool wide = wide_frame();
 	const rectangle clip(0, WIDTH - 1, 0, HEIGHT - 1);
+	const bool fc = polygons && m_video->freecam_on() && freecam_scene();   // (the free camera: no HUD, the backdrop moved)
+	const bool hud_off = (m_hud_hidden && game_mode() == 9) || fc;   // (Display > HUD Off, in a fight: maps 0 and 1 not drawn over the 3D)
+	bool has_hud_names = false;
+	{
+		std::lock_guard<std::mutex> lk(m_hud_mx);
+		const bool online = !m_hud_names[0].empty() || !m_hud_names[1].empty();
+		const std::string *names = online ? m_hud_names : m_random_hud;
+		has_hud_names = !hud_off && (!names[0].empty() || !names[1].empty());
+	}
+	const uint64_t cache_key[12] = {
+		m_tiles.tile_version,
+		m_tiles.char_version,
+		m_pal2d_version,
+		uint64_t(s),
+		uint64_t(e),
+		uint64_t(hud_off),
+		uint64_t(m_backdrop_smooth),
+		uint64_t(parts),
+		uint64_t(m_video->smooth()),
+		uint64_t(polygons && m_video->shows_framebuffer()),
+		uint64_t(m_tiles.hidden_frames()),
+		uint64_t(wide)
+	};
+	if (!fc && !has_hud_names && m_2d_cache_valid && std::memcmp(m_2d_cache_key, cache_key, sizeof(cache_key)) == 0) {
+		return;
+	}
+	const uint64_t bg_key[8] = {
+		m_tiles.tile_ver_bg,
+		m_tiles.char_version,
+		m_pal2d_version,
+		uint64_t(s),
+		uint64_t(e),
+		uint64_t(m_backdrop_smooth),
+		uint64_t(parts),
+		uint64_t(wide)
+	};
+	const bool bg_dirty = fc || !m_2d_bg_valid || std::memcmp(m_2d_bg_key, bg_key, sizeof(bg_key)) != 0;
 	m_tiles.update(m_pens.data());
 	// the 2D at the arcade's resolution, its column 0 at e; in a wide frame the backdrop's maps
 	// (2 and 3) carry on to the sides, from the stage's panorama where it's known
-	const bool fc = polygons && m_video->freecam_on() && freecam_scene();   // (the free camera: no HUD, the backdrop moved)
 	const segas24_tile::panorama *pan = wide || fc ? find_panorama() : nullptr;
 	// the three bitmaps at once, each on a thread (the tiles' planes are only read)
-	const bool hud_off = (m_hud_hidden && game_mode() == 9) || fc;   // (Display > HUD Off, in a fight: maps 0 and 1 not drawn over the 3D)
+	const int prev_mid_y0 = m_mid_y0, prev_mid_y1 = m_mid_y1;
+	const int prev_top_y0 = m_top_y0, prev_top_y1 = m_top_y1;
+	segas24_tile::row_range mid_rr, top_rr;
 	m_tiles.m_ox = e;
-	parallel_tasks(3, [&](int task) {
-		const rectangle all(0, w - 1, 0, HEIGHT - 1);
-		if (task == 0) {
-			m_sys24.fill(0, all);
-			for (int layer = 3; layer >= 2; layer--) {
-				if (fc && m_tiles.can_shift(layer << 1)) { m_tiles.draw_shifted(m_sys24, layer << 1, segas24_tile::DRAW_OPAQUE, wide ? e : 0, pan, m_fc_dx, m_fc_dy); continue; }
-				m_tiles.draw(m_sys24, clip, layer << 1, 0, segas24_tile::DRAW_OPAQUE);
-				if (wide) m_tiles.draw_sides(m_sys24, layer << 1, segas24_tile::DRAW_OPAQUE, e, pan);
-			}
-		} else if (task == 1) {
-			m_sys24_mid.fill(0, all);
-			for (int layer = 1; layer >= 0 && !fc; layer--)
-				m_tiles.draw(m_sys24_mid, clip, layer << 1, 0, 0);
-		} else {
-			m_sys24_top.fill(0, all);
-			for (int layer = 3; layer >= (hud_off ? 2 : 0); layer--) {
-				if (fc && m_tiles.can_shift(layer << 1)) { m_tiles.draw_shifted(m_sys24_top, (layer << 1) | 1, 0, wide ? e : 0, pan, m_fc_dx, m_fc_dy); continue; }
-				m_tiles.draw(m_sys24_top, clip, (layer << 1) | 1, 0, 0);
-				if (wide && layer >= 2) m_tiles.draw_sides(m_sys24_top, (layer << 1) | 1, 0, e, pan);
+	auto draw_bg = [&]() {
+		if (m_tiles.tile_ram[0x5007] & 0x8000) {
+			m_sys24.fill(0, rectangle(0, w - 1, 0, HEIGHT - 1));
+		} else if (wide) {
+			for (int y = 0; y < HEIGHT; ++y) {
+				uint32_t *row = &m_sys24.pix(y);
+				std::fill(row, row + e, 0u);
+				std::fill(row + e + WIDTH, row + w, 0u);
 			}
 		}
-	});
+		for (int layer = 3; layer >= 2; layer--) {
+			if (fc && m_tiles.can_shift(layer << 1)) { m_tiles.draw_shifted(m_sys24, layer << 1, segas24_tile::DRAW_OPAQUE, wide ? e : 0, pan, m_fc_dx, m_fc_dy); continue; }
+			m_tiles.draw(m_sys24, clip, layer << 1, 0, segas24_tile::DRAW_OPAQUE);
+			if (wide) m_tiles.draw_sides(m_sys24, layer << 1, segas24_tile::DRAW_OPAQUE, e, pan);
+		}
+	};
+	auto draw_fg = [&]() {
+		if (prev_mid_y1 > prev_mid_y0)
+			m_sys24_mid.fill(0, rectangle(0, w - 1, prev_mid_y0, prev_mid_y1 - 1));
+		for (int layer = 1; layer >= 0 && !fc; layer--)
+			m_tiles.draw(m_sys24_mid, clip, layer << 1, 0, 0, &mid_rr);
+
+		if (prev_top_y1 > prev_top_y0)
+			m_sys24_top.fill(0, rectangle(0, w - 1, prev_top_y0, prev_top_y1 - 1));
+		for (int layer = 3; layer >= (hud_off ? 2 : 0); layer--) {
+			if (fc && m_tiles.can_shift(layer << 1)) {
+				m_tiles.draw_shifted(m_sys24_top, (layer << 1) | 1, 0, wide ? e : 0, pan, m_fc_dx, m_fc_dy);
+				top_rr.add_span(0, HEIGHT);
+				continue;
+			}
+			m_tiles.draw(m_sys24_top, clip, (layer << 1) | 1, 0, 0, &top_rr);
+			if (wide && layer >= 2) m_tiles.draw_sides(m_sys24_top, (layer << 1) | 1, 0, e, pan, &top_rr);
+		}
+	};
+	if (bg_dirty) {
+		parallel_tasks(2, [&](int task) {
+			if (task == 0) draw_bg();
+			else draw_fg();
+		});
+	} else {
+		draw_fg();
+	}
 	m_tiles.m_ox = 0;
+	m_mid_y0 = mid_rr.y0 < mid_rr.y1 ? mid_rr.y0 : 0;
+	m_mid_y1 = mid_rr.y0 < mid_rr.y1 ? mid_rr.y1 : 0;
+	m_top_y0 = top_rr.y0 < top_rr.y1 ? top_rr.y0 : 0;
+	m_top_y1 = top_rr.y0 < top_rr.y1 ? top_rr.y1 : 0;
 	{   // (online play: the players' names in place of their fighters', in the picture only; offline, a random fighter's)
 		std::lock_guard<std::mutex> lk(m_hud_mx);
 		const bool online = !m_hud_names[0].empty() || !m_hud_names[1].empty();
@@ -2459,6 +2571,10 @@ void model2a::draw_2d(bool polygons, bool parts)
 			const m2hud::Flag *fl[2] = { &m_hud_flags[0], &m_hud_flags[1] };
 			if (!m2hud::draw(m_tiles, m_sys24_top, e, names, online ? fl : nullptr, m_hud_flag_at))
 				for (auto &a : m_hud_flag_at) a[0] = a[1] = -1;
+			else {
+				m_top_y0 = 0;
+				m_top_y1 = HEIGHT;
+			}
 		} else
 			for (auto &a : m_hud_flag_at) a[0] = a[1] = -1;
 	}
@@ -2467,6 +2583,15 @@ void model2a::draw_2d(bool polygons, bool parts)
 	m_2d_wide = wide;
 	m_2d_filter = smooth;
 	m_2d_version++;
+	if (!fc && !has_hud_names) {
+		std::memcpy(m_2d_cache_key, cache_key, sizeof(cache_key));
+		m_2d_cache_valid = true;
+		std::memcpy(m_2d_bg_key, bg_key, sizeof(bg_key));
+		m_2d_bg_valid = true;
+	} else {
+		m_2d_cache_valid = false;
+		m_2d_bg_valid = false;
+	}
 	if (parts && (smooth || m_video->smooth())) {   // the backdrop PAD pixels larger each way, its edges carried on; opaque
 		constexpr int P = picture_parts::PAD;
 		const int pw = w + 2 * P;
@@ -2937,7 +3062,7 @@ void model2a::set_aspect(float aspect)
 	resize_screen();
 	const int old_ext = m_video->ext();
 	m_video->set_ext(m_ext);
-	set_scenery_culling(m_ext ? 2 : 0);
+	set_scenery_culling(m_ext == 0 ? 0 : (m_aspect <= 1.85f ? 1 : 2));
 	// the 3D still to be shown set up again at the new width, from the lists kept, each drawn in
 	// its own frame's colours (smooth motion's lists; without them it waits for the next frame)
 	if (m_video->smooth() && m_ext != old_ext) {
@@ -3074,6 +3199,9 @@ void model2a::resize_screen()
 		m_sys24.allocate(w, HEIGHT + 4);
 		m_sys24_mid.allocate(w, HEIGHT + 4);
 		m_sys24_top.allocate(w, HEIGHT + 4);
+		m_mid_y0 = 0; m_mid_y1 = HEIGHT;
+		m_top_y0 = 0; m_top_y1 = HEIGHT;
+		m_2d_cache_valid = false;
 	}
 }
 
@@ -3527,8 +3655,11 @@ void model2a::sound_reset()
 	m_audio_out.clear();
 	m_audio_raw.clear();
 	uart_txd(1);   // the i8251's reset: TxD high
-	// the sound manager's update, every 1/50 s from power-on
-	timer_adjust(T_SOUND_UPDATE, AS_PER_SEC / 50, 0, AS_PER_SEC / 50);
+	// the sound manager's update, every 1/50 s from power-on (only needed when sound is active on this board)
+	if (m_sound_on)
+		timer_adjust(T_SOUND_UPDATE, AS_PER_SEC / 50, 0, AS_PER_SEC / 50);
+	else
+		timer_disable(T_SOUND_UPDATE);
 	// the 68000: power-on and reset (it reads its vectors when it first runs)
 	m_snd_bus = std::make_unique<snd_bus>(*this);
 	m_68k = std::make_unique<m68000_device>(*m_snd_bus, 45158400 / 4);
@@ -3580,9 +3711,14 @@ void model2a::take_audio()
 	std::vector<float> &o = m_scsp->m_out;
 	if (o.empty()) return;
 	const float g = m_scsp->output_gain();
-	auto s16 = [](double v) { return int16_t(std::clamp(std::lround(v * 32768.0), -32768l, 32767l)); };
+	auto s16 = [](float v) {
+		const float scaled = v * 32768.0f;
+		const int32_t iv = int32_t(scaled + (scaled >= 0.0f ? 0.5f : -0.5f));
+		return int16_t(std::clamp<int32_t>(iv, -32768, 32767));
+	};
+	if (m_sound_on) m_audio_out.reserve(m_audio_out.size() + o.size());
 	if (m_sound_on && m_level == 1.0f)
-		for (float v : o) m_audio_out.push_back(s16(double(v) * g));
+		for (float v : o) m_audio_out.push_back(s16(v * g));
 	else if (m_sound_on) {
 		constexpr float CEILING = 0.891f, RELEASE = 1.0f / (0.1f * SOUND_RATE);
 		for (size_t i = 0; i + 1 < o.size(); i += 2) {

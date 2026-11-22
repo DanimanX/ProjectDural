@@ -41,16 +41,19 @@ if [ -z "$SDL_GAMECONTROLLERCONFIG" ]; then
   export SDL_GAMECONTROLLERCONFIG="19000000010000000100000000010000,Anbernic RG34XX Controller,platform:Linux,b:b3,a:b4,dpdown:h0.4,leftx:a0,lefty:a1,lefttrigger:b12,dpleft:h0.8,rightshoulder:b8,leftshoulder:b7,righttrigger:b13,dpright:h0.2,back:b9,start:b10,dpup:h0.1,y:b6,x:b5,guide:b11,"
 fi
 
-# Lock CPU governor to performance while playing if permitted
+# Lock CPU and Mali GPU devfreq governors to performance while playing if permitted
 ORIG_GOV=""
 if [ -w /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]; then
   ORIG_GOV=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || true)
   for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
     echo performance > "$g" 2>/dev/null || true
   done
+  for d in /sys/class/devfreq/*/governor; do
+    [ -w "$d" ] && echo performance > "$d" 2>/dev/null || true
+  done
 elif [ -n "$ESUDO" ] && command -v "$ESUDO" >/dev/null 2>&1 && [ -f /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]; then
   ORIG_GOV=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || true)
-  $ESUDO sh -c 'for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do echo performance > "$g" 2>/dev/null || true; done' 2>/dev/null || true
+  $ESUDO sh -c 'for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor /sys/class/devfreq/*/governor; do [ -f "$g" ] && echo performance > "$g" 2>/dev/null || true; done' 2>/dev/null || true
 fi
 
 pm_platform_helper "$GAMEDIR/vf2.aarch64" >/dev/null 2>&1 || true

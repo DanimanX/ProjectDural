@@ -13,6 +13,20 @@ class segas24_tile
 public:
 	enum { DRAW_OPAQUE = 0x10000 };
 
+	struct row_range {
+		int y0 = 384, y1 = 0;
+		void add(int y) {
+			if (y < y0) y0 = y;
+			if (y + 1 > y1) y1 = y + 1;
+		}
+		void add_span(int a, int b) {
+			if (a < b) {
+				if (a < y0) y0 = a;
+				if (b > y1) y1 = b;
+			}
+		}
+	};
+
 	segas24_tile() : char_ram(0x80000 / 2), tile_ram(0x10000 / 2) {}
 
 	uint16_t tile_r(offs_t o) const { return tile_ram[o & 0x7fff]; }
@@ -23,7 +37,11 @@ public:
 	{
 		o &= 0x7fff;
 		const uint16_t v = (tile_ram[o] & ~m) | (d & m);
-		if (o < 0x4000 && v != tile_ram[o]) { m_entry_dirty[o] = 1; m_entries_dirty = true; }
+		if (v != tile_ram[o]) {
+			tile_version++;
+			if (o >= 0x2000) tile_ver_bg++;
+			if (o < 0x4000) { m_entry_dirty[o] = 1; m_entries_dirty = true; }
+		}
 		tile_ram[o] = v;
 	}
 	void char_w(offs_t o, uint16_t d, uint16_t m)
@@ -34,10 +52,12 @@ public:
 		char_ram[o] = v;
 	}
 	uint64_t char_version = 0;          // (counts the tile graphics' writes: a copy of them is still good while it's the same)
-	void mark_dirty() { m_dirty = true; }
+	uint64_t tile_version = 1;          // (counts tile_ram / scroll / window mask writes)
+	uint64_t tile_ver_bg = 1;           // (counts backdrop layers 2/3 / mask writes)
+	void mark_dirty() { m_dirty = true; tile_version++; tile_ver_bg++; }
 	// (VF2's player select, drawing only: a player's cursor frame on the fighters' icons not drawn, bit 0 player 1's
 	// (tiles af80-af8d on map 0, rows 34-44), bit 1 player 2's (af8e-af9b): a random player's, whose slot isn't its own)
-	void hide_frames(uint8_t h) { if (h != m_hide_frames) { m_hide_frames = h; m_dirty = true; } }
+	void hide_frames(uint8_t h) { if (h != m_hide_frames) { m_hide_frames = h; m_dirty = true; tile_version++; } }
 	uint8_t hidden_frames() const { return m_hide_frames; }
 	// (drawing only: map entries drawn as other tiles, entry index -> its tile word: VF2's ranking's random fighters'
 	// names)
@@ -47,6 +67,7 @@ public:
 		for (const auto &[e, v] : m_subst) if (e < 0x4000) { m_entry_dirty[e] = 1; m_entries_dirty = true; }
 		m_subst = std::move(s);
 		for (const auto &[e, v] : m_subst) if (e < 0x4000) { m_entry_dirty[e] = 1; m_entries_dirty = true; }
+		tile_version++;
 	}   // (the RAMs swapped from outside: decode again)
 	// n words from o of the tile RAM (maps true: the maps' entries) or of the tile graphics, written from
 	// outside (a save state's pages put back): decoded again at the next update()
@@ -55,6 +76,8 @@ public:
 		if (maps) {
 			for (size_t i = o; i < o + n && i < 0x4000; i++) m_entry_dirty[i] = 1;
 			m_entries_dirty = true;
+			tile_version++;
+			if (o + n > 0x2000) tile_ver_bg++;
 		} else {
 			for (size_t i = o; i < o + n && i < char_ram.size(); i += 16) m_char_dirty[i >> 4] = 1;
 			m_chars_dirty = true;
@@ -108,7 +131,7 @@ public:
 		m_entries_dirty = m_chars_dirty = false;
 	}
 
-	void draw(bitmap_rgb32 &bitmap, const rectangle &cliprect, int layer, int lpri, int flags_in)
+	void draw(bitmap_rgb32 &bitmap, const rectangle &cliprect, int layer, int lpri, int flags_in, row_range *bounds = nullptr)
 	{
 		uint16_t hscr = tile_ram[0x5000 + (layer >> 1)];
 		uint16_t vscr = tile_ram[0x5004 + (layer >> 1)];
@@ -135,14 +158,14 @@ public:
 						uint16_t v = (-vscr) & 0x1ff;
 						if (!((-vscr) & 0x200)) l1 ^= 1;
 						if (y >= v) l1 ^= 1;
-						draw_scrolled(bitmap, c, l1, -h, sy, tpri, flags_in);
+						draw_scrolled(bitmap, c, l1, -h, sy, tpri, flags_in, bounds);
 					} else {
 						rectangle c1 = c, c2 = c;
 						if (c1.max_x >= h) c1.max_x = h - 1;
 						if (c2.min_x < h) c2.min_x = h;
 						if (!(hscrtb[y] & 0x200)) l1 ^= 1;
-						draw_scrolled(bitmap, c1, l1, -h, sy, tpri, flags_in);
-						draw_scrolled(bitmap, c2, l1 ^ 1, -h, sy, tpri, flags_in);
+						draw_scrolled(bitmap, c1, l1, -h, sy, tpri, flags_in, bounds);
+						draw_scrolled(bitmap, c2, l1 ^ 1, -h, sy, tpri, flags_in, bounds);
 					}
 				}
 			} else {
@@ -159,8 +182,8 @@ public:
 					if (c2.min_x < h) c2.min_x = h;
 					if (!(hscr & 0x200)) layer ^= 1;
 				}
-				draw_scrolled(bitmap, c1, layer, sx, sy, tpri, flags_in);
-				draw_scrolled(bitmap, c2, layer ^ 1, sx, sy, tpri, flags_in);
+				draw_scrolled(bitmap, c1, layer, sx, sy, tpri, flags_in, bounds);
+				draw_scrolled(bitmap, c2, layer ^ 1, sx, sy, tpri, flags_in, bounds);
 			}
 			return;
 		}
@@ -172,10 +195,10 @@ public:
 			for (int y = 0; y < 384; y++) {
 				uint16_t h = (-hscrtb[y]) & 0x1ff;
 				if (h + 496 <= 512)
-					draw_rect(layer, bitmap, mask, tpri, flags_in, win, h, vscr, 0, y, 496, y + 1);
+					draw_rect(layer, bitmap, mask, tpri, flags_in, win, h, vscr, 0, y, 496, y + 1, bounds);
 				else {
-					draw_rect(layer, bitmap, mask, tpri, flags_in, win, h, vscr, 0, y, 512 - h, y + 1);
-					draw_rect(layer, bitmap, mask, tpri, flags_in, win, 0, vscr, 512 - h, y, 496, y + 1);
+					draw_rect(layer, bitmap, mask, tpri, flags_in, win, h, vscr, 0, y, 512 - h, y + 1, bounds);
+					draw_rect(layer, bitmap, mask, tpri, flags_in, win, 0, vscr, 512 - h, y, 496, y + 1, bounds);
 				}
 				vscr = (vscr + 1) & 0x1ff;
 			}
@@ -184,20 +207,20 @@ public:
 			vscr = (+vscr) & 0x1ff;
 			if (hscr + 496 <= 512) {
 				if (vscr + 384 <= 512)
-					draw_rect(layer, bitmap, mask, tpri, flags_in, win, hscr, vscr, 0, 0, 496, 384);
+					draw_rect(layer, bitmap, mask, tpri, flags_in, win, hscr, vscr, 0, 0, 496, 384, bounds);
 				else {
-					draw_rect(layer, bitmap, mask, tpri, flags_in, win, hscr, vscr, 0, 0, 496, 512 - vscr);
-					draw_rect(layer, bitmap, mask, tpri, flags_in, win, hscr, 0, 0, 512 - vscr, 496, 384);
+					draw_rect(layer, bitmap, mask, tpri, flags_in, win, hscr, vscr, 0, 0, 496, 512 - vscr, bounds);
+					draw_rect(layer, bitmap, mask, tpri, flags_in, win, hscr, 0, 0, 512 - vscr, 496, 384, bounds);
 				}
 			} else {
 				if (vscr + 384 <= 512) {
-					draw_rect(layer, bitmap, mask, tpri, flags_in, win, hscr, vscr, 0, 0, 512 - hscr, 384);
-					draw_rect(layer, bitmap, mask, tpri, flags_in, win, 0, vscr, 512 - hscr, 0, 496, 384);
+					draw_rect(layer, bitmap, mask, tpri, flags_in, win, hscr, vscr, 0, 0, 512 - hscr, 384, bounds);
+					draw_rect(layer, bitmap, mask, tpri, flags_in, win, 0, vscr, 512 - hscr, 0, 496, 384, bounds);
 				} else {
-					draw_rect(layer, bitmap, mask, tpri, flags_in, win, hscr, vscr, 0, 0, 512 - hscr, 512 - vscr);
-					draw_rect(layer, bitmap, mask, tpri, flags_in, win, 0, vscr, 512 - hscr, 0, 496, 512 - vscr);
-					draw_rect(layer, bitmap, mask, tpri, flags_in, win, hscr, 0, 0, 512 - vscr, 512 - hscr, 384);
-					draw_rect(layer, bitmap, mask, tpri, flags_in, win, 0, 0, 512 - hscr, 512 - vscr, 496, 384);
+					draw_rect(layer, bitmap, mask, tpri, flags_in, win, hscr, vscr, 0, 0, 512 - hscr, 512 - vscr, bounds);
+					draw_rect(layer, bitmap, mask, tpri, flags_in, win, 0, vscr, 512 - hscr, 0, 496, 512 - vscr, bounds);
+					draw_rect(layer, bitmap, mask, tpri, flags_in, win, hscr, 0, 0, 512 - vscr, 512 - hscr, 384, bounds);
+					draw_rect(layer, bitmap, mask, tpri, flags_in, win, 0, 0, 512 - hscr, 512 - vscr, 496, 384, bounds);
 				}
 			}
 		}
@@ -247,7 +270,7 @@ public:
 	// from the panorama, the 8 columns inside each edge: the map's tile column across the edge is
 	// often a frame behind (the game copies it in as it comes into view: at 4:3 a few pixels at
 	// the screen's edge, wider in the middle of the picture).
-	void draw_sides(bitmap_rgb32 &bitmap, int layer, int flags_in, int ext, const panorama *pan)
+	void draw_sides(bitmap_rgb32 &bitmap, int layer, int flags_in, int ext, const panorama *pan, row_range *bounds = nullptr, int y0 = 0, int y1 = 384)
 	{
 		constexpr int INNER = 8;
 		const int l = layer >> 1;
@@ -258,11 +281,15 @@ public:
 		const bool opaque = flags_in & DRAW_OPAQUE;
 		const bool split = ctrl & 0x6000, hsplit = split && (ctrl & 0x6000) >> 13 != 1;
 		const int hs = (hscr & 0x8000) ? -1 : hscr & 0x1ff;
-		for (int y = 0; y < 384 && y < bitmap.height(); y++) {
+		const int pan_w = pan ? pan->cols * 8 : 0;
+		const bool pan_pow2 = pan_w > 0 && (pan_w & (pan_w - 1)) == 0;
+		const int y_end = std::min(y1, bitmap.height());
+		for (int y = y0; y < y_end; y++) {
 			int m0, my, x0;
 			if (!line_source(layer, y, m0, my, x0)) return;
 			uint32_t *row = &bitmap.pix(y);
 			const int hy = hs >= 0 ? hs : tile_ram[0x4000 + 0x200 * l + y] & 0x1ff;
+			bool row_wrote = false;
 			for (int side = 0; side < 2; side++)
 				for (int x = side ? 496 - INNER : -ext; x < (side ? 496 + ext : INNER); x++) {
 					const bool inside = x >= 0 && x < 496;
@@ -281,9 +308,8 @@ public:
 					const bool from_pan = pan && m == 2 && r < pan->rows && pan->at[r] >= 0;
 					if (inside && !from_pan) continue;   // (the game's own, as drawn)
 					if (from_pan) {
-						const int w = pan->cols * 8;
 						const int at = pan->at[r] + ((x0 - pan->x0[r] + 256) & 511) - 256;
-						const int px = (((at + x) % w) + w) % w;
+						const int px = pan_pow2 ? ((at + x) & (pan_w - 1)) : ((((at + x) % pan_w) + pan_w) % pan_w);
 						const uint16_t e = pan->entries[size_t(my >> 3) * pan->cols + (px >> 3)];
 						const uint16_t *c = &char_ram[(size_t(e & tile_mask) * 16 + (my & 7) * 2) & 0x3ffff];
 						const uint32_t bits = (uint32_t(c[0]) << 16) | c[1];
@@ -294,8 +320,12 @@ public:
 						pen = pix[m][size_t(my) * 512 + mx];
 						flag = flags[m][size_t(my) * 512 + mx];
 					}
-					if (opaque || flag == want) row[m_ox + x] = m_pens[pen & 0x1fff];
+					if (opaque || flag == want) {
+						row[m_ox + x] = m_pens[pen & 0x1fff];
+						row_wrote = true;
+					}
 				}
+			if (row_wrote && bounds) bounds->add(y);
 		}
 	}
 
@@ -441,52 +471,151 @@ public:
 	uint32_t *m_coord = nullptr;
 private:
 
-	void draw_scrolled(bitmap_rgb32 &bm, const rectangle &c, int l, int scrollx, int scrolly, uint16_t tpri, int fl)
+	void draw_scrolled(bitmap_rgb32 &bm, const rectangle &c, int l, int scrollx, int scrolly, uint16_t tpri, int fl, row_range *bounds = nullptr)
 	{
 		uint8_t want = uint8_t(tpri | 0x10);
 		// c is in arcade pixels (0..495); the destination is offset by m_ox
 		const int x0 = std::max({c.min_x, 0, -m_ox}), x1 = std::min({c.max_x, 495, bm.width() - 1 - m_ox});
-		for (int y = std::max(c.min_y, 0); y <= std::min({c.max_y, 383, bm.height() - 1}); y++)
+		for (int y = std::max(c.min_y, 0); y <= std::min({c.max_y, 383, bm.height() - 1}); y++) {
+			bool row_wrote = false;
 			for (int x = x0; x <= x1; x++) {
 				size_t i = size_t((y + scrolly) & 511) * 512 + ((x + scrollx) & 511);
 				if (flags[l][i] == want || (fl & DRAW_OPAQUE)) {
 					bm.pix(y, x + m_ox) = m_pens[pix[l][i] & 0x1fff];
 					if (m_coord) m_coord[size_t(y) * bm.width() + x + m_ox] = uint32_t(l) << 18 | uint32_t(i);
+					row_wrote = true;
 				}
 			}
+			if (row_wrote && bounds) bounds->add(y);
+		}
 	}
 
 	void draw_rect(int l, bitmap_rgb32 &dm, const uint16_t *mask, uint16_t tpri, int fl, int win,
-				   int sx, int sy, int xx1, int yy1, int xx2, int yy2)
+				   int sx, int sy, int xx1, int yy1, int xx2, int yy2, row_range *bounds = nullptr)
 	{
 		tpri |= 0x10;
 		int dst_x = xx1;            // MAME takes the destination before the group shift
 		mask += yy1 * 4;
 		while (xx1 >= 128) { xx1 -= 128; xx2 -= 128; mask++; }
+		if (m_coord) {
+			for (int y = 0; y < yy2 - yy1; y++) {
+				int dy = yy1 + y;
+				if (dy >= dm.height()) break;
+				const uint16_t *src = &pix[l][size_t((sy + y) & 511) * 512 + sx];
+				const uint8_t *srct = &flags[l][size_t((sy + y) & 511) * 512 + sx];
+				uint32_t *dst = &dm.pix(dy, dst_x + m_ox);
+				uint32_t *crd = m_coord + size_t(dy) * dm.width() + dst_x + m_ox;
+				const uint16_t *mask1 = mask + y * 4;
+				int llx = xx2, cur_x = xx1;
+				bool row_wrote = false;
+				while (llx > 0) {
+					uint16_t m = *mask1++;
+					if (win) m = ~m;
+					int llx1 = llx >= 128 ? 128 : llx;
+					for (int x = cur_x; x < llx1; x++) {
+						if ((*srct == tpri || (fl & DRAW_OPAQUE)) && !(m & (0x8000 >> (x >> 3)))) {
+							*dst = m_pens[*src & 0x1fff];
+							*crd = uint32_t(l) << 18 | uint32_t(src - pix[l].data());
+							row_wrote = true;
+						}
+						src++; srct++; dst++; crd++;
+					}
+					llx -= 128;
+					cur_x = 0;
+				}
+				if (row_wrote && bounds) bounds->add(dy);
+			}
+			return;
+		}
+		const uint32_t *const pens = m_pens;
+		const bool opaque = (fl & DRAW_OPAQUE) != 0;
+		const uint8_t want = uint8_t(tpri);
+		const uint64_t tpri8 = uint64_t(want) * 0x0101010101010101ULL;
 		for (int y = 0; y < yy2 - yy1; y++) {
 			int dy = yy1 + y;
 			if (dy >= dm.height()) break;
 			const uint16_t *src = &pix[l][size_t((sy + y) & 511) * 512 + sx];
 			const uint8_t *srct = &flags[l][size_t((sy + y) & 511) * 512 + sx];
 			uint32_t *dst = &dm.pix(dy, dst_x + m_ox);
-			uint32_t *crd = m_coord ? m_coord + size_t(dy) * dm.width() + dst_x + m_ox : nullptr;
 			const uint16_t *mask1 = mask + y * 4;
 			int llx = xx2, cur_x = xx1;
+			bool row_wrote = false;
 			while (llx > 0) {
 				uint16_t m = *mask1++;
 				if (win) m = ~m;
-				int llx1 = llx >= 128 ? 128 : llx;
-				for (int x = cur_x; x < llx1; x++) {
-					if ((*srct == tpri || (fl & DRAW_OPAQUE)) && !(m & (0x8000 >> (x >> 3)))) {
-						*dst = m_pens[*src & 0x1fff];
-						if (crd) *crd = uint32_t(l) << 18 | uint32_t(src - pix[l].data());
+				const int llx1 = llx >= 128 ? 128 : llx;
+				const int count = llx1 - cur_x;
+				if (m == 0xffff) {
+					src += count; srct += count; dst += count;
+					llx -= 128; cur_x = 0;
+					continue;
+				}
+				if (m == 0x0000) {
+					if (opaque) {
+						int i = 0;
+						for (; i + 4 <= count; i += 4) {
+							dst[i]     = pens[src[i]];
+							dst[i + 1] = pens[src[i + 1]];
+							dst[i + 2] = pens[src[i + 2]];
+							dst[i + 3] = pens[src[i + 3]];
+						}
+						for (; i < count; ++i) dst[i] = pens[src[i]];
+						if (count > 0) row_wrote = true;
+					} else {
+						int i = 0;
+						for (; i + 8 <= count; i += 8) {
+							uint64_t f8;
+							std::memcpy(&f8, srct + i, 8);
+							if (f8 == 0) continue;
+							const uint64_t x8 = f8 ^ tpri8;
+							if (((x8 - 0x0101010101010101ULL) & ~x8 & 0x8080808080808080ULL) == 0) continue;
+							for (int k = 0; k < 8; ++k) {
+								if (srct[i + k] == want) dst[i + k] = pens[src[i + k] & 0x1fff];
+							}
+							row_wrote = true;
+						}
+						for (; i < count; ++i) {
+							if (srct[i] == want) { dst[i] = pens[src[i] & 0x1fff]; row_wrote = true; }
+						}
 					}
-					src++; srct++; dst++;
-					if (crd) crd++;
+					src += count; srct += count; dst += count;
+				} else {
+					int x = cur_x;
+					while (x < llx1) {
+						const int tile_end = std::min(llx1, (x & ~7) + 8);
+						const int step = tile_end - x;
+						if (m & (0x8000 >> (x >> 3))) {
+							src += step; srct += step; dst += step;
+						} else if (opaque) {
+							for (int i = 0; i < step; ++i) dst[i] = pens[src[i] & 0x1fff];
+							row_wrote = true;
+							src += step; srct += step; dst += step;
+						} else if (step == 8) {
+							uint64_t f8;
+							std::memcpy(&f8, srct, 8);
+							if (f8 != 0) {
+								const uint64_t x8 = f8 ^ tpri8;
+								if (((x8 - 0x0101010101010101ULL) & ~x8 & 0x8080808080808080ULL) != 0) {
+									for (int k = 0; k < 8; ++k) {
+										if (srct[k] == want) dst[k] = pens[src[k] & 0x1fff];
+									}
+									row_wrote = true;
+								}
+							}
+							src += 8; srct += 8; dst += 8;
+						} else {
+							for (int i = 0; i < step; ++i) {
+								if (srct[i] == want) { dst[i] = pens[src[i] & 0x1fff]; row_wrote = true; }
+							}
+							src += step; srct += step; dst += step;
+						}
+						x = tile_end;
+					}
 				}
 				llx -= 128;
 				cur_x = 0;
 			}
+			if (row_wrote && bounds) bounds->add(dy);
 		}
 	}
 };

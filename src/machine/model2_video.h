@@ -389,6 +389,7 @@ private:
 	void smooth_note_light(float x, float y, float z);
 	void render_polygons();
 	void build_drawn(raster_state *raster, std::vector<drawn_poly> &drawn);
+	void build_gpu_polys(raster_state *raster, std::vector<gpu3d_poly> &out);
 	void geo_run(u32 *buffer, u32 start, geo_state *geo, raster_state *raster);
 	void draw_framebuffer(bitmap_rgb32 &bitmap, const rectangle &cliprect);
 	void export_list(const std::vector<drawn_poly> &list, std::vector<gpu3d_poly> &out) const;
@@ -486,6 +487,8 @@ public:
 	void draw_owner(const model2_video::drawn_poly &p, int scale, u32 index, bitmap_rgb32 &owner);
 	void set_xoffset(int16_t xoffs) { m_xoffs = xoffs; }
 	void set_yoffset(int16_t yoffs) { m_yoffs = yoffs; }
+	int16_t xoffs() const { return m_xoffs; }
+	int16_t yoffs() const { return m_yoffs; }
 
 	template <bool Translucent>
 	void draw_scanline_solid(int32_t scanline, const extent_t &extent, const m2_poly_extra_data &object, int threadid);
@@ -525,6 +528,7 @@ struct model2_video::picture3d
 {
 	bitmap_rgb32 map;
 	std::vector<drawn_poly> drawn;
+	std::vector<gpu3d_poly> gpu_polys;
 	bool deferred = false;   // the list not drawn in the map yet
 };
 
@@ -606,6 +610,8 @@ struct model2_video::raster_state
 	{
 		std::fill(std::begin(command_buffer), std::end(command_buffer), 0);
 		std::fill(std::begin(poly_sorted_list), std::end(poly_sorted_list), nullptr);
+		std::fill(std::begin(z_mask), std::end(z_mask), 0);
+		std::fill(std::begin(z_mask_l2), std::end(z_mask_l2), 0);
 		std::fill(std::begin(texture_ram), std::end(texture_ram), 0);
 		std::fill(std::begin(log_ram), std::end(log_ram), 0);
 	}
@@ -627,6 +633,8 @@ struct model2_video::raster_state
 	polygon         poly_list[MAX_POLYGONS];        // Polygon list
 	u32             poly_list_index = 0;            // Polygon list index
 	polygon *       poly_sorted_list[0x10000];      // Sorted polygon list
+	u64             z_mask[1024];                   // 1 bit per occupied z bucket (8 KB)
+	u64             z_mask_l2[16];                  // 1 bit per non-zero z_mask word (128 B)
 	u16             min_z = 0;                      // Minimum sortable Z value
 	u16             max_z = 0;                      // Maximum sortable Z value
 	u16             texture_ram[0x10000];           // Texture RAM pointer
