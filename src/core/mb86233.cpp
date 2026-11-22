@@ -217,7 +217,6 @@ inline void mb86233_device::alu_pre(u32 alu)
 
 	case 0x10: {
 		// fdvd
-		m_alu_stmask = F_ZRD|F_SGD|F_CPD|F_OVD|F_DVZD;
 		m_alu_r1 = f2u(u2f(m_d) / u2f(m_a));
 		stset_set_sz_fp(m_alu_r1);
 		break;
@@ -225,7 +224,6 @@ inline void mb86233_device::alu_pre(u32 alu)
 
 	case 0x11: {
 		// fned
-		m_alu_stmask = F_ZRD|F_SGD|F_CPD|F_OVD|F_DVZD;
 		m_alu_r1 = m_d ? m_d ^ 0x80000000 : 0;
 		stset_set_sz_fp(m_alu_r1);
 		break;
@@ -233,7 +231,6 @@ inline void mb86233_device::alu_pre(u32 alu)
 
 	case 0x13: {
 		// d = b + a
-		m_alu_stmask = F_ZRD|F_SGD|F_CPD|F_OVD|F_DVZD;
 		m_alu_r1 = f2u(u2f(m_b) + u2f(m_a));
 		stset_set_sz_fp(m_alu_r1);
 		break;
@@ -241,7 +238,6 @@ inline void mb86233_device::alu_pre(u32 alu)
 
 	case 0x14: {
 		// d = b - a
-		m_alu_stmask = F_ZRD|F_SGD|F_CPD|F_OVD|F_DVZD;
 		m_alu_r1 = f2u(u2f(m_b) - u2f(m_a));
 		stset_set_sz_fp(m_alu_r1);
 		break;
@@ -249,7 +245,6 @@ inline void mb86233_device::alu_pre(u32 alu)
 
 	case 0x16: {
 		// lsrd
-		m_alu_stmask = F_ZRD|F_SGD|F_CPD|F_OVD|F_DVZD;
 		m_alu_r1 = m_d >> (m_sft & 31);   // (vf2-recomp: a count of 32 or more, from a program in a snapshot, as x86 and Arm shift: undefined in C++)
 		stset_set_sz_int(m_alu_r1);
 		break;
@@ -257,7 +252,6 @@ inline void mb86233_device::alu_pre(u32 alu)
 
 	case 0x17: {
 		// lsld
-		m_alu_stmask = F_ZRD|F_SGD|F_CPD|F_OVD|F_DVZD;
 		m_alu_r1 = m_d << (m_sft & 31);
 		stset_set_sz_int(m_alu_r1);
 		break;
@@ -265,7 +259,6 @@ inline void mb86233_device::alu_pre(u32 alu)
 
 	case 0x18: {
 		// asrd
-		m_alu_stmask = F_ZRD|F_SGD|F_CPD|F_OVD|F_DVZD;
 		m_alu_r1 = s32(m_d) >> (m_sft & 31);
 		stset_set_sz_int(m_alu_r1);
 		break;
@@ -273,7 +266,6 @@ inline void mb86233_device::alu_pre(u32 alu)
 
 	case 0x19: {
 		// asld
-		m_alu_stmask = F_ZRD|F_SGD|F_CPD|F_OVD|F_DVZD;
 		m_alu_r1 = u32(s32(m_d)) << (m_sft & 31);
 		stset_set_sz_int(m_alu_r1);
 		break;
@@ -281,7 +273,6 @@ inline void mb86233_device::alu_pre(u32 alu)
 
 	case 0x1a: {
 		// addd
-		m_alu_stmask = F_ZRD|F_SGD|F_CPD|F_OVD|F_DVZD;
 		m_alu_r1 = m_d + m_a;
 		stset_set_sz_int(m_alu_r1);
 		break;
@@ -289,7 +280,6 @@ inline void mb86233_device::alu_pre(u32 alu)
 
 	case 0x1b: {
 		// subd
-		m_alu_stmask = F_ZRD|F_SGD|F_CPD|F_OVD|F_DVZD;
 		m_alu_r1 = m_d - m_a;
 		stset_set_sz_int(m_alu_r1);
 		break;
@@ -301,6 +291,17 @@ inline void mb86233_device::alu_pre(u32 alu)
 	}
 }
 
+static constexpr u32 kIntAluPostMask =
+	(1u << 0x01) | (1u << 0x02) | (1u << 0x03) | (1u << 0x04) |
+	(1u << 0x0e) | (1u << 0x0f) | (1u << 0x16) | (1u << 0x17) |
+	(1u << 0x18) | (1u << 0x19) | (1u << 0x1a) | (1u << 0x1b);
+
+static constexpr u32 kFpAluPostMask =
+	(1u << 0x05) | (1u << 0x06) | (1u << 0x07) | (1u << 0x08) |
+	(1u << 0x09) | (1u << 0x0a) | (1u << 0x0b) | (1u << 0x0c) |
+	(1u << 0x0d) | (1u << 0x10) | (1u << 0x11) | (1u << 0x13) |
+	(1u << 0x14);
+
 inline void mb86233_device::alu_update_st()
 {
 	m_st = (m_st & ~(F_ZRD|F_SGD|F_CPD|F_OVD|F_DVZD)) | m_alu_stset;
@@ -308,36 +309,21 @@ inline void mb86233_device::alu_update_st()
 
 inline void mb86233_device::alu_post_1(u32 alu)
 {
-	// integer alu post ops
-	switch(alu) {
-	case 0x01: case 0x02: case 0x03: case 0x04:
-	case 0x0e: case 0x0f: case 0x16: case 0x17:
-	case 0x18: case 0x19: case 0x1a: case 0x1b:
-		// d update
+	// integer alu post ops (all update d + flags)
+	if (alu < 32 && (kIntAluPostMask & (1u << alu))) {
 		m_d = m_alu_r1;
 		alu_update_st();
-		break;
-
-	default:
-		break;
 	}
 }
 
 inline void mb86233_device::alu_post_2(u32 alu)
 {
-	// floating point alu post ops
-	// assume each one takes 2 cycles
+	// floating point alu post ops; assume each one takes 2 cycles
+	if (alu >= 32 || !(kFpAluPostMask & (1u << alu)))
+		return;
 	switch (alu) {
 	case 0x05:
 		// flags only
-		alu_update_st();
-		m_icount--;
-		break;
-
-	case 0x06: case 0x07: case 0x0b: case 0x0c:
-	case 0x10: case 0x11: case 0x13: case 0x14:
-		// d update
-		m_d = m_alu_r1;
 		alu_update_st();
 		m_icount--;
 		break;
@@ -357,6 +343,10 @@ inline void mb86233_device::alu_post_2(u32 alu)
 		break;
 
 	default:
+		// d update (0x06, 0x07, 0x0b, 0x0c, 0x10, 0x11, 0x13, 0x14)
+		m_d = m_alu_r1;
+		alu_update_st();
+		m_icount--;
 		break;
 	}
 }
@@ -364,8 +354,12 @@ inline void mb86233_device::alu_post_2(u32 alu)
 inline void mb86233_device::alu_exec_full(u32 alu)
 {
 	alu_pre(alu);
-	alu_post_1(alu);
-	alu_post_2(alu);
+	if (alu < 32 && (kIntAluPostMask & (1u << alu))) {
+		m_d = m_alu_r1;
+		alu_update_st();
+	} else {
+		alu_post_2(alu);
+	}
 }
 
 inline u16 mb86233_device::ea_pre_0(u32 r)

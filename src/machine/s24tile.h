@@ -118,13 +118,32 @@ public:
 			m_dirty = false;
 			for (int l = 0; l < 4; l++) { pix[l].resize(512 * 512); flags[l].resize(512 * 512); }
 			for (int e = 0; e < 0x4000; e++) decode_entry(e);
+			recompute_cat_rows();
 		} else {
 			if (m_chars_dirty)
 				for (int e = 0; e < 0x4000; e++)
 					if (m_char_dirty[tile_ram[e] & tile_mask]) m_entry_dirty[e] = 1;
-			if (m_entries_dirty || m_chars_dirty)
-				for (int e = 0; e < 0x4000; e++)
-					if (m_entry_dirty[e]) decode_entry(e);
+			if (m_entries_dirty || m_chars_dirty) {
+				uint64_t dirty_rows[4] = {};
+				for (int e = 0; e < 0x4000; e++) {
+					if (m_entry_dirty[e]) {
+						decode_entry(e);
+						dirty_rows[e >> 12] |= 1ULL << ((e >> 6) & 63);
+					}
+				}
+				for (int l = 0; l < 4; l++) {
+					uint64_t d = dirty_rows[l];
+					while (d) {
+						const int ty = __builtin_ctzll(d);
+						d &= d - 1;
+						uint8_t row_or = 0;
+						for (int tx = 0; tx < 64; tx++) row_or |= m_tile_cat[l][ty][tx];
+						const uint64_t bit = 1ULL << ty;
+						if (row_or & 1) m_layer_cat_rows[l][0] |= bit; else m_layer_cat_rows[l][0] &= ~bit;
+						if (row_or & 2) m_layer_cat_rows[l][1] |= bit; else m_layer_cat_rows[l][1] &= ~bit;
+					}
+				}
+			}
 		}
 		std::fill(std::begin(m_entry_dirty), std::end(m_entry_dirty), 0);
 		std::fill(std::begin(m_char_dirty), std::end(m_char_dirty), 0);
@@ -280,6 +299,7 @@ public:
 		const uint8_t want = uint8_t((layer & 1) | 0x10);
 		const bool opaque = flags_in & DRAW_OPAQUE;
 		const bool split = ctrl & 0x6000, hsplit = split && (ctrl & 0x6000) >> 13 != 1;
+		if (!opaque && !split && !m_layer_cat_rows[l][layer & 1]) return;
 		const int hs = (hscr & 0x8000) ? -1 : hscr & 0x1ff;
 		const int pan_w = pan ? pan->cols * 8 : 0;
 		const bool pan_pow2 = pan_w > 0 && (pan_w & (pan_w - 1)) == 0;
@@ -287,24 +307,37 @@ public:
 		for (int y = y0; y < y_end; y++) {
 			int m0, my, x0;
 			if (!line_source(layer, y, m0, my, x0)) return;
+			const int r = my >> 3;
+			const bool pan_row = pan && m0 == 2 && r < pan->rows && pan->at[r] >= 0;
+			if (!opaque && !pan_row && !((m_layer_cat_rows[m0][layer & 1] >> r) & 1)) continue;
 			uint32_t *row = &bitmap.pix(y);
 			const int hy = hs >= 0 ? hs : tile_ram[0x4000 + 0x200 * l + y] & 0x1ff;
 			bool row_wrote = false;
-			for (int side = 0; side < 2; side++)
-				for (int x = side ? 496 - INNER : -ext; x < (side ? 496 + ext : INNER); x++) {
+			const uint16_t *const pm0 = &pix[m0][size_t(my) * 512];
+			const uint8_t *const fm0 = &flags[m0][size_t(my) * 512];
+			const bool fast_side = !pan && !hsplit && opaque && !split;
+			for (int side = 0; side < 2; side++) {
+				if (!split) {
+					const int dx = side ? 495 : 0;
+					uint16_t mk = mask[y * 4 + (dx >> 7)];
+					if (l & 1) mk = ~mk;
+					if (mk & (side ? 0x0001 : 0x8000)) continue;
+				}
+				const int x_start = side ? (pan_row ? 496 - INNER : 496) : -ext;
+				const int x_end = side ? 496 + ext : (pan_row ? INNER : 0);
+				if (fast_side) {
+					for (int x = x_start; x < x_end; x++)
+						row[m_ox + x] = m_pens[pm0[(x0 + x) & 511] & 0x1fff];
+					if (x_start < x_end) row_wrote = true;
+					continue;
+				}
+				for (int x = x_start; x < x_end; x++) {
 					const bool inside = x >= 0 && x < 496;
 					int m = m0;
 					if (hsplit && x >= hy) m ^= 1;   // (the horizontal split: the other map from column h)
 					const int mx = (x0 + x) & 511;
-					if (!split) {
-						const int dx = std::clamp(x, 0, 495);
-						uint16_t mk = mask[y * 4 + (dx >> 7)];
-						if (l & 1) mk = ~mk;
-						if (mk & (0x8000 >> ((dx & 127) >> 3))) continue;
-					}
 					uint16_t pen;
 					uint8_t flag;
-					const int r = my >> 3;
 					const bool from_pan = pan && m == 2 && r < pan->rows && pan->at[r] >= 0;
 					if (inside && !from_pan) continue;   // (the game's own, as drawn)
 					if (from_pan) {
@@ -325,6 +358,7 @@ public:
 						row_wrote = true;
 					}
 				}
+			}
 			if (row_wrote && bounds) bounds->add(y);
 		}
 	}
@@ -442,6 +476,22 @@ private:
 
 	uint8_t m_hide_frames = 0;   // (hide_frames)
 	std::map<uint16_t, uint16_t> m_subst;   // (substitute)
+	uint8_t m_tile_cat[4][64][64] = {};
+	uint64_t m_layer_cat_rows[4][2] = {};
+	void recompute_cat_rows()
+	{
+		for (int l = 0; l < 4; l++) {
+			uint64_t c0 = 0, c1 = 0;
+			for (int ty = 0; ty < 64; ty++) {
+				uint8_t row_or = 0;
+				for (int tx = 0; tx < 64; tx++) row_or |= m_tile_cat[l][ty][tx];
+				if (row_or & 1) c0 |= (1ULL << ty);
+				if (row_or & 2) c1 |= (1ULL << ty);
+			}
+			m_layer_cat_rows[l][0] = c0;
+			m_layer_cat_rows[l][1] = c1;
+		}
+	}
 	void decode_entry(int e)
 	{
 		const int l = e >> 12, ty = (e >> 6) & 63, tx = e & 63;
@@ -454,9 +504,11 @@ private:
 		uint32_t color = (val >> 7) & 0xff;
 		uint8_t cat = (val & 0x8000) ? 1 : 0;
 		const uint16_t *c = &char_ram[(code * 16) & 0x3ffff];
+		uint32_t nz_or = 0;
 		for (int y = 0; y < 8; y++) {
 			uint16_t w0 = c[y * 2], w1 = c[y * 2 + 1];
 			uint32_t row = (uint32_t(w0) << 16) | w1;
+			nz_or |= row;
 			size_t base = size_t(ty * 8 + y) * 512 + tx * 8;
 			for (int x = 0; x < 8; x++) {
 				uint8_t p = (row >> (28 - 4 * x)) & 0xf;
@@ -464,6 +516,7 @@ private:
 				fm[base + x] = p ? uint8_t(0x10 | cat) : 0;
 			}
 		}
+		m_tile_cat[l][ty][tx] = nz_or ? uint8_t(1u << cat) : 0;
 	}
 public:
 	// When set (a buffer the size of the destination), draw_rect also records where each pixel
@@ -530,10 +583,13 @@ private:
 		const uint32_t *const pens = m_pens;
 		const bool opaque = (fl & DRAW_OPAQUE) != 0;
 		const uint8_t want = uint8_t(tpri);
+		const uint64_t cat_rows = opaque ? ~0ULL : m_layer_cat_rows[l][want & 1];
+		if (!cat_rows) return;
 		const uint64_t tpri8 = uint64_t(want) * 0x0101010101010101ULL;
 		for (int y = 0; y < yy2 - yy1; y++) {
 			int dy = yy1 + y;
 			if (dy >= dm.height()) break;
+			if (!opaque && !((cat_rows >> (((sy + y) & 511) >> 3)) & 1)) continue;
 			const uint16_t *src = &pix[l][size_t((sy + y) & 511) * 512 + sx];
 			const uint8_t *srct = &flags[l][size_t((sy + y) & 511) * 512 + sx];
 			uint32_t *dst = &dm.pix(dy, dst_x + m_ox);

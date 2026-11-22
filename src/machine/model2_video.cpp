@@ -140,7 +140,7 @@ static inline void transform_vector(poly_vertex *vector, float *matrix)
 
 static inline void normalize_vector(poly_vertex *vector)
 {
-	const float n = sqrt((vector->x * vector->x) + (vector->y * vector->y) + (vector->pz * vector->pz));
+	const float n = sqrtf((vector->x * vector->x) + (vector->y * vector->y) + (vector->pz * vector->pz));
 
 	if (n)
 	{
@@ -1800,7 +1800,24 @@ inline void model2_video::model2_3d_push(raster_state *raster, u32 input)
 
 void model2_video::geo_parse_np_ns(geo_state *geo, u32 *input, u32 count)
 {
-	raster_state *raster = geo->raster;
+	raster_state * __restrict raster = geo->raster;
+	const float * __restrict m = geo->matrix;
+	const float m0 = m[0], m1 = m[1], m2 = m[2];
+	const float m3 = m[3], m4 = m[4], m5 = m[5];
+	const float m6 = m[6], m7 = m[7], m8 = m[8];
+	const float m9 = m[9], m10 = m[10], m11 = m[11];
+	const float fx = geo->focus.x, fy = geo->focus.y;
+	const float lx = geo->light.x, ly = geo->light.y, lz = geo->light.pz;
+	const float lod = geo->lod;
+	const bool has_build = (m_build_obj.side >= 0);
+
+	auto xform_pt_focus = [&](poly_vertex &pt) {
+		const float x = pt.x, y = pt.y, z = pt.pz;
+		pt.x = ((x * m0) + (y * m3) + (z * m6) + m9) * fx;
+		pt.y = ((x * m1) + (y * m4) + (z * m7) + m10) * fy;
+		pt.pz = (x * m2) + (y * m5) + (z * m8) + m11;
+	};
+
 	poly_vertex point, normal;
 	u32  attr, i;
 
@@ -1808,14 +1825,7 @@ void model2_video::geo_parse_np_ns(geo_state *geo, u32 *input, u32 count)
 	point.x = u2f(GEO_NEXT(input));
 	point.y = u2f(GEO_NEXT(input));
 	point.pz = u2f(GEO_NEXT(input));
-
-	/* transform with the current matrix */
-	transform_point(&point, geo->matrix);
-
-	/* apply focus */
-	apply_focus(geo, &point);
-
-	/* push it to the 3d rasterizer */
+	xform_pt_focus(point);
 	model2_3d_push(raster, f2u(point.x) >> 8);
 	model2_3d_push(raster, f2u(point.y) >> 8);
 	model2_3d_push(raster, f2u(point.pz) >> 8);
@@ -1824,120 +1834,113 @@ void model2_video::geo_parse_np_ns(geo_state *geo, u32 *input, u32 count)
 	point.x = u2f(GEO_NEXT(input));
 	point.y = u2f(GEO_NEXT(input));
 	point.pz = u2f(GEO_NEXT(input));
-
-	/* transform with the current matrix */
-	transform_point(&point, geo->matrix);
-
-	/* apply focus */
-	apply_focus(geo, &point);
-
-	/* push it to the 3d rasterizer */
+	xform_pt_focus(point);
 	model2_3d_push(raster, f2u(point.x) >> 8);
 	model2_3d_push(raster, f2u(point.y) >> 8);
 	model2_3d_push(raster, f2u(point.pz) >> 8);
 
+	const bool direct = (raster->cur_command == 0x01 && raster->command_index == 8);
+	u32 * __restrict cb = raster->command_buffer;
+
 	/* loop through the following links */
 	for (i = 0; i < count && input < m_geo_end; i++)
 	{
-		if (m_build_obj.side >= 0) raster->build_tint = build_tint(i);   // (the random fighters' build)
+		if (has_build) raster->build_tint = build_tint(i);   // (the random fighters' build)
 		/* read in the attributes */
 		attr = GEO_NEXT(input);
-
-		/* push to the 3d rasterizer */
-		model2_3d_push(raster, attr & 0x0003ffff);
+		const u32 attr_masked = attr & 0x0003ffff;
 
 		/* read in the normal */
-		normal.x = u2f(GEO_NEXT(input));
-		normal.y = u2f(GEO_NEXT(input));
-		normal.pz = u2f(GEO_NEXT(input));
-
-		/* transform with the current matrix */
-		transform_vector(&normal, geo->matrix);
+		const float nx_in = u2f(GEO_NEXT(input));
+		const float ny_in = u2f(GEO_NEXT(input));
+		const float nz_in = u2f(GEO_NEXT(input));
+		normal.x = (nx_in * m0) + (ny_in * m3) + (nz_in * m6);
+		normal.y = (nx_in * m1) + (ny_in * m4) + (nz_in * m7);
+		normal.pz = (nx_in * m2) + (ny_in * m5) + (nz_in * m8);
 
 		if ((attr & 3) != 0) /* quad or triangle */
 		{
-			float               dotl, dotp, luminance, distance;
-			float               coef, face;
-			int32_t               luma;
-			texture_parameter * texparam;
-
 			/* read in the next point */
-			point.x = u2f(GEO_NEXT(input));
-			point.y = u2f(GEO_NEXT(input));
-			point.pz = u2f(GEO_NEXT(input));
-
-			/* transform with the current matrix */
-			transform_point(&point, geo->matrix);
+			const float px_in = u2f(GEO_NEXT(input));
+			const float py_in = u2f(GEO_NEXT(input));
+			const float pz_in = u2f(GEO_NEXT(input));
+			point.x = (px_in * m0) + (py_in * m3) + (pz_in * m6) + m9;
+			point.y = (px_in * m1) + (py_in * m4) + (pz_in * m7) + m10;
+			point.pz = (px_in * m2) + (py_in * m5) + (pz_in * m8) + m11;
 
 			/* calculate the dot product of the normal and the light vector */
-			dotl = dot_product(normal, geo->light);
+			const float dotl = (normal.x * lx) + (normal.y * ly) + (normal.pz * lz);
 
 			/* calculate the dot product of the normal and the point */
-			dotp = dot_product(normal, point);
+			const float dotp = (normal.x * point.x) + (normal.y * point.y) + (normal.pz * point.pz);
 
 			/* apply focus */
-			apply_focus(geo, &point);
+			point.x *= fx;
+			point.y *= fy;
 
 			/* determine whether this is the front or the back of the polygon */
-			face = 0x100; /* rear */
-			if (dotp >= 0) face = 0; /* front */
+			const int32_t face = (dotp >= 0.0f) ? 0 : 0x100;
 
 			/* get the texture parameters */
-			texparam = &geo->texture_parameters[(attr>>18) & 0x1f];
+			const texture_parameter *texparam = &geo->texture_parameters[(attr >> 18) & 0x1f];
 
 			/* calculate luminance */
-			if ((dotl * dotp) < 0) luminance = 0;
-			else luminance = fabs(dotl);
-
+			float luminance = ((dotl * dotp) < 0.0f) ? 0.0f : fabsf(dotl);
 			luminance = (luminance * texparam->diffuse) + texparam->ambient;
 			luminance = std::clamp(luminance, 0.0f, 255.0f);
-
-			luma = (int32_t)luminance;
-
-			/* add the face bit to the luma */
-			luma += face;
-
-			/* extract distance coefficient */
-			coef = geo->coef_table[attr>>27];
+			const int32_t luma = (int32_t)luminance + face;
 
 			/* calculate texture level of detail */
-			distance = coef * fabs(dotp) * geo->lod;
+			const float coef = geo->coef_table[attr >> 27];
+			const float distance = coef * fabsf(dotp) * lod;
 
-			/* push to the 3d rasterizer */
-			model2_3d_push(raster, luma << 15);
-			model2_3d_push(raster, f2u(distance) >> 8);
-			model2_3d_push(raster, f2u(point.x) >> 8);
-			model2_3d_push(raster, f2u(point.y) >> 8);
-			model2_3d_push(raster, f2u(point.pz) >> 8);
-
-			/* if it's a quad, push one more point */
-			if (attr & 1)
-			{
-				/* read in the next point */
-				point.x = u2f(GEO_NEXT(input));
-				point.y = u2f(GEO_NEXT(input));
-				point.pz = u2f(GEO_NEXT(input));
-
-				/* transform with the current matrix */
-				transform_point(&point, geo->matrix);
-
-				/* apply focus */
-				apply_focus(geo, &point);
-
-				/* push to the 3d rasterizer */
+			if (direct) {
+				cb[8] = attr_masked;
+				cb[9] = luma << 15;
+				cb[10] = f2u(distance) >> 8;
+				cb[11] = f2u(point.x) >> 8;
+				cb[12] = f2u(point.y) >> 8;
+				cb[13] = f2u(point.pz) >> 8;
+				if (attr & 1) {
+					point.x = u2f(GEO_NEXT(input));
+					point.y = u2f(GEO_NEXT(input));
+					point.pz = u2f(GEO_NEXT(input));
+					xform_pt_focus(point);
+					cb[14] = f2u(point.x) >> 8;
+					cb[15] = f2u(point.y) >> 8;
+					cb[16] = f2u(point.pz) >> 8;
+					model2_3d_process_polygon<4>(raster, attr_masked);
+				} else {
+					input = GEO_SKIP(input, 3);
+					model2_3d_process_polygon<3>(raster, attr_masked);
+				}
+			} else {
+				model2_3d_push(raster, attr_masked);
+				model2_3d_push(raster, luma << 15);
+				model2_3d_push(raster, f2u(distance) >> 8);
 				model2_3d_push(raster, f2u(point.x) >> 8);
 				model2_3d_push(raster, f2u(point.y) >> 8);
 				model2_3d_push(raster, f2u(point.pz) >> 8);
-			}
-			else /* triangle */
-			{
-				/* skip the next 3 points */
-				input = GEO_SKIP(input, 3);
+				if (attr & 1) {
+					point.x = u2f(GEO_NEXT(input));
+					point.y = u2f(GEO_NEXT(input));
+					point.pz = u2f(GEO_NEXT(input));
+					xform_pt_focus(point);
+					model2_3d_push(raster, f2u(point.x) >> 8);
+					model2_3d_push(raster, f2u(point.y) >> 8);
+					model2_3d_push(raster, f2u(point.pz) >> 8);
+				} else {
+					input = GEO_SKIP(input, 3);
+				}
 			}
 		}
 		else /* we're done */
 		{
-			break;
+			if (direct)
+				raster->cur_command = 0;
+			else
+				model2_3d_push(raster, attr_masked);
+			return;
 		}
 	}
 
@@ -1948,7 +1951,24 @@ void model2_video::geo_parse_np_ns(geo_state *geo, u32 *input, u32 count)
 /* Parse Polygons: Normals Present, Specular case */
 void model2_video::geo_parse_np_s(geo_state *geo, u32 *input, u32 count)
 {
-	raster_state *raster = geo->raster;
+	raster_state * __restrict raster = geo->raster;
+	const float * __restrict m = geo->matrix;
+	const float m0 = m[0], m1 = m[1], m2 = m[2];
+	const float m3 = m[3], m4 = m[4], m5 = m[5];
+	const float m6 = m[6], m7 = m[7], m8 = m[8];
+	const float m9 = m[9], m10 = m[10], m11 = m[11];
+	const float fx = geo->focus.x, fy = geo->focus.y;
+	const float lx = geo->light.x, ly = geo->light.y, lz = geo->light.pz;
+	const float lod = geo->lod;
+	const bool has_build = (m_build_obj.side >= 0);
+
+	auto xform_pt_focus = [&](poly_vertex &pt) {
+		const float x = pt.x, y = pt.y, z = pt.pz;
+		pt.x = ((x * m0) + (y * m3) + (z * m6) + m9) * fx;
+		pt.y = ((x * m1) + (y * m4) + (z * m7) + m10) * fy;
+		pt.pz = (x * m2) + (y * m5) + (z * m8) + m11;
+	};
+
 	poly_vertex point, normal;
 	u32  attr, i;
 
@@ -1956,14 +1976,7 @@ void model2_video::geo_parse_np_s(geo_state *geo, u32 *input, u32 count)
 	point.x = u2f(GEO_NEXT(input));
 	point.y = u2f(GEO_NEXT(input));
 	point.pz = u2f(GEO_NEXT(input));
-
-	/* transform with the current matrix */
-	transform_point(&point, geo->matrix);
-
-	/* apply focus */
-	apply_focus(geo, &point);
-
-	/* push it to the 3d rasterizer */
+	xform_pt_focus(point);
 	model2_3d_push(raster, f2u(point.x) >> 8);
 	model2_3d_push(raster, f2u(point.y) >> 8);
 	model2_3d_push(raster, f2u(point.pz) >> 8);
@@ -1972,129 +1985,124 @@ void model2_video::geo_parse_np_s(geo_state *geo, u32 *input, u32 count)
 	point.x = u2f(GEO_NEXT(input));
 	point.y = u2f(GEO_NEXT(input));
 	point.pz = u2f(GEO_NEXT(input));
-
-	/* transform with the current matrix */
-	transform_point(&point, geo->matrix);
-
-	/* apply focus */
-	apply_focus(geo, &point);
-
-	/* push it to the 3d rasterizer */
+	xform_pt_focus(point);
 	model2_3d_push(raster, f2u(point.x) >> 8);
 	model2_3d_push(raster, f2u(point.y) >> 8);
 	model2_3d_push(raster, f2u(point.pz) >> 8);
 
+	const bool direct = (raster->cur_command == 0x01 && raster->command_index == 8);
+	u32 * __restrict cb = raster->command_buffer;
+
 	/* loop through the following links */
 	for (i = 0; i < count && input < m_geo_end; i++)
 	{
-		if (m_build_obj.side >= 0) raster->build_tint = build_tint(i);   // (the random fighters' build)
+		if (has_build) raster->build_tint = build_tint(i);   // (the random fighters' build)
 		/* read in the attributes */
 		attr = GEO_NEXT(input);
-
-		/* push to the 3d rasterizer */
-		model2_3d_push(raster, attr & 0x0003ffff);
+		const u32 attr_masked = attr & 0x0003ffff;
 
 		/* read in the normal */
-		normal.x = u2f(GEO_NEXT(input));
-		normal.y = u2f(GEO_NEXT(input));
-		normal.pz = u2f(GEO_NEXT(input));
-
-		/* transform with the current matrix */
-		transform_vector(&normal, geo->matrix);
+		const float nx_in = u2f(GEO_NEXT(input));
+		const float ny_in = u2f(GEO_NEXT(input));
+		const float nz_in = u2f(GEO_NEXT(input));
+		normal.x = (nx_in * m0) + (ny_in * m3) + (nz_in * m6);
+		normal.y = (nx_in * m1) + (ny_in * m4) + (nz_in * m7);
+		normal.pz = (nx_in * m2) + (ny_in * m5) + (nz_in * m8);
 
 		if ((attr & 3) != 0) /* quad or triangle */
 		{
-			float               dotl, dotp, luminance, distance, specular;
-			float               coef, face;
-			int32_t             luma;
-			texture_parameter * texparam;
-
 			/* read in the next point */
-			point.x = u2f(GEO_NEXT(input));
-			point.y = u2f(GEO_NEXT(input));
-			point.pz = u2f(GEO_NEXT(input));
-
-			/* transform with the current matrix */
-			transform_point(&point, geo->matrix);
+			const float px_in = u2f(GEO_NEXT(input));
+			const float py_in = u2f(GEO_NEXT(input));
+			const float pz_in = u2f(GEO_NEXT(input));
+			point.x = (px_in * m0) + (py_in * m3) + (pz_in * m6) + m9;
+			point.y = (px_in * m1) + (py_in * m4) + (pz_in * m7) + m10;
+			point.pz = (px_in * m2) + (py_in * m5) + (pz_in * m8) + m11;
 
 			/* calculate the dot product of the normal and the light vector */
-			dotl = dot_product(normal, geo->light);
+			const float dotl = (normal.x * lx) + (normal.y * ly) + (normal.pz * lz);
 
 			/* calculate the dot product of the normal and the point */
-			dotp = dot_product(normal, point);
+			const float dotp = (normal.x * point.x) + (normal.y * point.y) + (normal.pz * point.pz);
 
 			/* apply focus */
-			apply_focus(geo, &point);
+			point.x *= fx;
+			point.y *= fy;
 
 			/* determine whether this is the front or the back of the polygon */
-			face = 0x100; /* rear */
-			if (dotp >= 0) face = 0; /* front */
+			const int32_t face = (dotp >= 0.0f) ? 0 : 0x100;
 
 			/* get the texture parameters */
-			texparam = &geo->texture_parameters[(attr>>18) & 0x1f];
+			const texture_parameter *texparam = &geo->texture_parameters[(attr >> 18) & 0x1f];
 
 			/* calculate luminance and specular */
-			if ((dotl * dotp) < 0) luminance = 0;
-			else luminance = fabs(dotl);
+			float luminance = ((dotl * dotp) < 0.0f) ? 0.0f : fabsf(dotl);
 
-			specular = ((2*dotl) * normal.pz) - geo->light.pz;
-			if (specular < 0) specular = 0;
-			if (texparam->specular_control == 0) specular = 0;
+			float specular = ((2.0f * dotl) * normal.pz) - lz;
+			if (specular < 0.0f) specular = 0.0f;
+			if (texparam->specular_control == 0) specular = 0.0f;
 			if ((texparam->specular_control >> 1) != 0) specular *= specular;
 			if ((texparam->specular_control >> 2) != 0) specular *= specular;
-			if (((texparam->specular_control+1) >> 3) != 0) specular *= specular;
+			if (((texparam->specular_control + 1) >> 3) != 0) specular *= specular;
 
 			specular *= texparam->specular_scale;
 
 			luminance = (luminance * texparam->diffuse) + texparam->ambient + specular;
 			luminance = std::clamp(luminance, 0.0f, 255.0f);
 
-			luma = (int32_t)luminance;
-
-			/* add the face bit to the luma */
-			luma += face;
-
-			/* extract distance coefficient */
-			coef = geo->coef_table[attr>>27];
+			const int32_t luma = (int32_t)luminance + face;
 
 			/* calculate texture level of detail */
-			distance = coef * fabs(dotp) * geo->lod;
+			const float coef = geo->coef_table[attr >> 27];
+			const float distance = coef * fabsf(dotp) * lod;
 
-			/* push to the 3d rasterizer */
-			model2_3d_push(raster, luma << 15);
-			model2_3d_push(raster, f2u(distance) >> 8);
-			model2_3d_push(raster, f2u(point.x) >> 8);
-			model2_3d_push(raster, f2u(point.y) >> 8);
-			model2_3d_push(raster, f2u(point.pz) >> 8);
-
-			/* if it's a quad, push one more point */
-			if (attr & 1)
-			{
-				/* read in the next point */
-				point.x = u2f(GEO_NEXT(input));
-				point.y = u2f(GEO_NEXT(input));
-				point.pz = u2f(GEO_NEXT(input));
-
-				/* transform with the current matrix */
-				transform_point(&point, geo->matrix);
-
-				/* apply focus */
-				apply_focus(geo, &point);
-
-				/* push to the 3d rasterizer */
+			if (direct) {
+				cb[8] = attr_masked;
+				cb[9] = luma << 15;
+				cb[10] = f2u(distance) >> 8;
+				cb[11] = f2u(point.x) >> 8;
+				cb[12] = f2u(point.y) >> 8;
+				cb[13] = f2u(point.pz) >> 8;
+				if (attr & 1) {
+					point.x = u2f(GEO_NEXT(input));
+					point.y = u2f(GEO_NEXT(input));
+					point.pz = u2f(GEO_NEXT(input));
+					xform_pt_focus(point);
+					cb[14] = f2u(point.x) >> 8;
+					cb[15] = f2u(point.y) >> 8;
+					cb[16] = f2u(point.pz) >> 8;
+					model2_3d_process_polygon<4>(raster, attr_masked);
+				} else {
+					input = GEO_SKIP(input, 3);
+					model2_3d_process_polygon<3>(raster, attr_masked);
+				}
+			} else {
+				model2_3d_push(raster, attr_masked);
+				model2_3d_push(raster, luma << 15);
+				model2_3d_push(raster, f2u(distance) >> 8);
 				model2_3d_push(raster, f2u(point.x) >> 8);
 				model2_3d_push(raster, f2u(point.y) >> 8);
 				model2_3d_push(raster, f2u(point.pz) >> 8);
-			}
-			else /* triangle */
-			{
-				/* skip the next 3 points */
-				input = GEO_SKIP(input, 3);
+				if (attr & 1) {
+					point.x = u2f(GEO_NEXT(input));
+					point.y = u2f(GEO_NEXT(input));
+					point.pz = u2f(GEO_NEXT(input));
+					xform_pt_focus(point);
+					model2_3d_push(raster, f2u(point.x) >> 8);
+					model2_3d_push(raster, f2u(point.y) >> 8);
+					model2_3d_push(raster, f2u(point.pz) >> 8);
+				} else {
+					input = GEO_SKIP(input, 3);
+				}
 			}
 		}
 		else /* we're done */
 		{
-			break;
+			if (direct)
+				raster->cur_command = 0;
+			else
+				model2_3d_push(raster, attr_masked);
+			return;
 		}
 	}
 
@@ -2105,7 +2113,24 @@ void model2_video::geo_parse_np_s(geo_state *geo, u32 *input, u32 count)
 /* Parse Polygons: No Normals, No Specular case */
 void model2_video::geo_parse_nn_ns(geo_state *geo, u32 *input, u32 count)
 {
-	raster_state *raster = geo->raster;
+	raster_state * __restrict raster = geo->raster;
+	const float * __restrict m = geo->matrix;
+	const float m0 = m[0], m1 = m[1], m2 = m[2];
+	const float m3 = m[3], m4 = m[4], m5 = m[5];
+	const float m6 = m[6], m7 = m[7], m8 = m[8];
+	const float m9 = m[9], m10 = m[10], m11 = m[11];
+	const float fx = geo->focus.x, fy = geo->focus.y;
+	const float lx = geo->light.x, ly = geo->light.y, lz = geo->light.pz;
+	const float lod = geo->lod;
+	const bool has_build = (m_build_obj.side >= 0);
+
+	auto xform_pt = [&](poly_vertex &pt) {
+		const float x = pt.x, y = pt.y, z = pt.pz;
+		pt.x = (x * m0) + (y * m3) + (z * m6) + m9;
+		pt.y = (x * m1) + (y * m4) + (z * m7) + m10;
+		pt.pz = (x * m2) + (y * m5) + (z * m8) + m11;
+	};
+
 	poly_vertex point, normal, p0, p1, p2, p3;
 	u32  attr, i;
 
@@ -2113,17 +2138,9 @@ void model2_video::geo_parse_nn_ns(geo_state *geo, u32 *input, u32 count)
 	point.x = u2f(GEO_NEXT(input));
 	point.y = u2f(GEO_NEXT(input));
 	point.pz = u2f(GEO_NEXT(input));
-
-	/* transform with the current matrix */
-	transform_point(&point, geo->matrix);
-
-	/* save for normal calculation */
-	p0.x = point.x; p0.y = point.y; p0.pz = point.pz;
-
-	/* apply focus */
-	apply_focus(geo, &point);
-
-	/* push it to the 3d rasterizer */
+	xform_pt(point);
+	p0 = point;
+	point.x *= fx; point.y *= fy;
 	model2_3d_push(raster, f2u(point.x) >> 8);
 	model2_3d_push(raster, f2u(point.y) >> 8);
 	model2_3d_push(raster, f2u(point.pz) >> 8);
@@ -2132,38 +2149,26 @@ void model2_video::geo_parse_nn_ns(geo_state *geo, u32 *input, u32 count)
 	point.x = u2f(GEO_NEXT(input));
 	point.y = u2f(GEO_NEXT(input));
 	point.pz = u2f(GEO_NEXT(input));
-
-	/* transform with the current matrix */
-	transform_point(&point, geo->matrix);
-
-	/* save for normal calculation */
-	p1.x = point.x; p1.y = point.y; p1.pz = point.pz;
-
-	/* apply focus */
-	apply_focus(geo, &point);
-
-	/* push it to the 3d rasterizer */
+	xform_pt(point);
+	p1 = point;
+	point.x *= fx; point.y *= fy;
 	model2_3d_push(raster, f2u(point.x) >> 8);
 	model2_3d_push(raster, f2u(point.y) >> 8);
 	model2_3d_push(raster, f2u(point.pz) >> 8);
 
+	const bool direct = (raster->cur_command == 0x01 && raster->command_index == 8);
+	u32 * __restrict cb = raster->command_buffer;
+
 	/* loop through the following links */
 	for (i = 0; i < count && input < m_geo_end; i++)
 	{
-		if (m_build_obj.side >= 0) raster->build_tint = build_tint(i);   // (the random fighters' build)
+		if (has_build) raster->build_tint = build_tint(i);   // (the random fighters' build)
 		/* read in the attributes */
 		attr = GEO_NEXT(input);
-
-		/* push to the 3d rasterizer */
-		model2_3d_push(raster, attr & 0x0003ffff);
+		const u32 attr_masked = attr & 0x0003ffff;
 
 		if ((attr & 3) != 0) /* quad or triangle */
 		{
-			float               dotl, dotp, luminance, distance;
-			float               coef, face;
-			int32_t             luma;
-			texture_parameter * texparam;
-
 			/* Skip normal */
 			input = GEO_SKIP(input, 3);
 
@@ -2171,121 +2176,101 @@ void model2_video::geo_parse_nn_ns(geo_state *geo, u32 *input, u32 count)
 			point.x = u2f(GEO_NEXT(input));
 			point.y = u2f(GEO_NEXT(input));
 			point.pz = u2f(GEO_NEXT(input));
+			xform_pt(point);
+			p2 = point;
 
-			/* transform with the current matrix */
-			transform_point(&point, geo->matrix);
-
-			/* save for normal calculation */
-			p2.x = point.x; p2.y = point.y; p2.pz = point.pz;
-
-			/* compute the normal */
+			/* compute the normal and normalize it */
 			vector_cross3(&normal, &p0, &p1, &p2);
-
-			/* normalize it */
 			normalize_vector(&normal);
 
-			/* calculate the dot product of the normal and the light vector */
-			dotl = dot_product(normal, geo->light);
-
-			/* calculate the dot product of the normal and the point */
-			dotp = dot_product(normal, point);
+			/* calculate dot products */
+			const float dotl = (normal.x * lx) + (normal.y * ly) + (normal.pz * lz);
+			const float dotp = (normal.x * point.x) + (normal.y * point.y) + (normal.pz * point.pz);
 
 			/* apply focus */
-			apply_focus(geo, &point);
+			point.x *= fx;
+			point.y *= fy;
 
-			/* determine whether this is the front or the back of the polygon */
-			face = 0x100; /* rear */
-			if (dotp >= 0) face = 0; /* front */
+			const int32_t face = (dotp >= 0.0f) ? 0 : 0x100;
+			const texture_parameter *texparam = &geo->texture_parameters[(attr >> 18) & 0x1f];
 
-			/* get the texture parameters */
-			texparam = &geo->texture_parameters[(attr>>18) & 0x1f];
-
-			/* calculate luminance */
-			if ((dotl * dotp) < 0) luminance = 0;
-			else luminance = fabs(dotl);
-
+			float luminance = ((dotl * dotp) < 0.0f) ? 0.0f : fabsf(dotl);
 			luminance = (luminance * texparam->diffuse) + texparam->ambient;
 			luminance = std::clamp(luminance, 0.0f, 255.0f);
+			const int32_t luma = (int32_t)luminance + face;
 
-			luma = (int32_t)luminance;
+			const float coef = geo->coef_table[attr >> 27];
+			const float distance = coef * fabsf(dotp) * lod;
 
-			/* add the face bit to the luma */
-			luma += face;
-
-			/* extract distance coefficient */
-			coef = geo->coef_table[attr>>27];
-
-			/* calculate texture level of detail */
-			distance = coef * fabs(dotp) * geo->lod;
-
-			/* push to the 3d rasterizer */
-			model2_3d_push(raster, luma << 15);
-			model2_3d_push(raster, f2u(distance) >> 8);
-			model2_3d_push(raster, f2u(point.x) >> 8);
-			model2_3d_push(raster, f2u(point.y) >> 8);
-			model2_3d_push(raster, f2u(point.pz) >> 8);
-
-			/* if it's a quad, push one more point */
-			if (attr & 1)
-			{
-				/* read in the next point */
-				point.x = u2f(GEO_NEXT(input));
-				point.y = u2f(GEO_NEXT(input));
-				point.pz = u2f(GEO_NEXT(input));
-
-				/* transform with the current matrix */
-				transform_point(&point, geo->matrix);
-
-				/* save for normal calculation */
-				p3.x = point.x; p3.y = point.y; p3.pz = point.pz;
-
-				/* apply focus */
-				apply_focus(geo, &point);
-
-				/* push to the 3d rasterizer */
+			if (direct) {
+				cb[8] = attr_masked;
+				cb[9] = luma << 15;
+				cb[10] = f2u(distance) >> 8;
+				cb[11] = f2u(point.x) >> 8;
+				cb[12] = f2u(point.y) >> 8;
+				cb[13] = f2u(point.pz) >> 8;
+				if (attr & 1) {
+					point.x = u2f(GEO_NEXT(input));
+					point.y = u2f(GEO_NEXT(input));
+					point.pz = u2f(GEO_NEXT(input));
+					xform_pt(point);
+					p3 = point;
+					point.x *= fx; point.y *= fy;
+					cb[14] = f2u(point.x) >> 8;
+					cb[15] = f2u(point.y) >> 8;
+					cb[16] = f2u(point.pz) >> 8;
+					model2_3d_process_polygon<4>(raster, attr_masked);
+				} else {
+					input = GEO_SKIP(input, 3);
+					p3 = p2;
+					model2_3d_process_polygon<3>(raster, attr_masked);
+				}
+			} else {
+				model2_3d_push(raster, attr_masked);
+				model2_3d_push(raster, luma << 15);
+				model2_3d_push(raster, f2u(distance) >> 8);
 				model2_3d_push(raster, f2u(point.x) >> 8);
 				model2_3d_push(raster, f2u(point.y) >> 8);
 				model2_3d_push(raster, f2u(point.pz) >> 8);
-			}
-			else
-			{
-				/* skip the next 3 points */
-				input = GEO_SKIP(input, 3);
-
-				/* for triangles, the rope of P1(n) is achieved by P0(n-1) (linktype 3) */
-				p3.x = p2.x; p3.y = p2.y; p3.pz = p2.pz;
+				if (attr & 1) {
+					point.x = u2f(GEO_NEXT(input));
+					point.y = u2f(GEO_NEXT(input));
+					point.pz = u2f(GEO_NEXT(input));
+					xform_pt(point);
+					p3 = point;
+					point.x *= fx; point.y *= fy;
+					model2_3d_push(raster, f2u(point.x) >> 8);
+					model2_3d_push(raster, f2u(point.y) >> 8);
+					model2_3d_push(raster, f2u(point.pz) >> 8);
+				} else {
+					input = GEO_SKIP(input, 3);
+					p3 = p2;
+				}
 			}
 		}
 		else /* we're done */
 		{
-			break;
+			if (direct)
+				raster->cur_command = 0;
+			else
+				model2_3d_push(raster, attr_masked);
+			return;
 		}
 
 		/* link type */
-		switch ((attr>>8) & 3)
+		switch ((attr >> 8) & 3)
 		{
 			case 0:
 			case 2:
-			{
-				/* reuse P0(n) and P1(n) */
-				p0.x = p2.x; p0.y = p2.y; p0.pz = p2.pz;
-				p1.x = p3.x; p1.y = p3.y; p1.pz = p3.pz;
-			}
-			break;
-
+				p0 = p2;
+				p1 = p3;
+				break;
 			case 1:
-			{
-				/* reuse P0(n-1) and P0(n) */
-				p1.x = p2.x; p1.y = p2.y; p1.pz = p2.pz;
-			}
-			break;
-
+				p1 = p2;
+				break;
 			case 3:
-			{
-				/* reuse P1(n-1) and P1(n) */
-				p0.x = p3.x; p0.y = p3.y; p0.pz = p3.pz;
-			}
-			break;
+				p0 = p3;
+				break;
 		}
 	}
 
@@ -2296,7 +2281,24 @@ void model2_video::geo_parse_nn_ns(geo_state *geo, u32 *input, u32 count)
 /* Parse Polygons: No Normals, Specular case */
 void model2_video::geo_parse_nn_s(geo_state *geo, u32 *input, u32 count)
 {
-	raster_state *raster = geo->raster;
+	raster_state * __restrict raster = geo->raster;
+	const float * __restrict m = geo->matrix;
+	const float m0 = m[0], m1 = m[1], m2 = m[2];
+	const float m3 = m[3], m4 = m[4], m5 = m[5];
+	const float m6 = m[6], m7 = m[7], m8 = m[8];
+	const float m9 = m[9], m10 = m[10], m11 = m[11];
+	const float fx = geo->focus.x, fy = geo->focus.y;
+	const float lx = geo->light.x, ly = geo->light.y, lz = geo->light.pz;
+	const float lod = geo->lod;
+	const bool has_build = (m_build_obj.side >= 0);
+
+	auto xform_pt = [&](poly_vertex &pt) {
+		const float x = pt.x, y = pt.y, z = pt.pz;
+		pt.x = (x * m0) + (y * m3) + (z * m6) + m9;
+		pt.y = (x * m1) + (y * m4) + (z * m7) + m10;
+		pt.pz = (x * m2) + (y * m5) + (z * m8) + m11;
+	};
+
 	poly_vertex point, normal, p0, p1, p2, p3;
 	u32  attr, i;
 
@@ -2304,17 +2306,9 @@ void model2_video::geo_parse_nn_s(geo_state *geo, u32 *input, u32 count)
 	point.x = u2f(GEO_NEXT(input));
 	point.y = u2f(GEO_NEXT(input));
 	point.pz = u2f(GEO_NEXT(input));
-
-	/* transform with the current matrix */
-	transform_point(&point, geo->matrix);
-
-	/* save for normal calculation */
-	p0.x = point.x; p0.y = point.y; p0.pz = point.pz;
-
-	/* apply focus */
-	apply_focus(geo, &point);
-
-	/* push it to the 3d rasterizer */
+	xform_pt(point);
+	p0 = point;
+	point.x *= fx; point.y *= fy;
 	model2_3d_push(raster, f2u(point.x) >> 8);
 	model2_3d_push(raster, f2u(point.y) >> 8);
 	model2_3d_push(raster, f2u(point.pz) >> 8);
@@ -2323,38 +2317,26 @@ void model2_video::geo_parse_nn_s(geo_state *geo, u32 *input, u32 count)
 	point.x = u2f(GEO_NEXT(input));
 	point.y = u2f(GEO_NEXT(input));
 	point.pz = u2f(GEO_NEXT(input));
-
-	/* transform with the current matrix */
-	transform_point(&point, geo->matrix);
-
-	/* save for normal calculation */
-	p1.x = point.x; p1.y = point.y; p1.pz = point.pz;
-
-	/* apply focus */
-	apply_focus(geo, &point);
-
-	/* push it to the 3d rasterizer */
+	xform_pt(point);
+	p1 = point;
+	point.x *= fx; point.y *= fy;
 	model2_3d_push(raster, f2u(point.x) >> 8);
 	model2_3d_push(raster, f2u(point.y) >> 8);
 	model2_3d_push(raster, f2u(point.pz) >> 8);
 
+	const bool direct = (raster->cur_command == 0x01 && raster->command_index == 8);
+	u32 * __restrict cb = raster->command_buffer;
+
 	/* loop through the following links */
 	for (i = 0; i < count && input < m_geo_end; i++)
 	{
-		if (m_build_obj.side >= 0) raster->build_tint = build_tint(i);   // (the random fighters' build)
+		if (has_build) raster->build_tint = build_tint(i);   // (the random fighters' build)
 		/* read in the attributes */
 		attr = GEO_NEXT(input);
-
-		/* push to the 3d rasterizer */
-		model2_3d_push(raster, attr & 0x0003ffff);
+		const u32 attr_masked = attr & 0x0003ffff;
 
 		if ((attr & 3) != 0) /* quad or triangle */
 		{
-			float               dotl, dotp, luminance, distance, specular;
-			float               coef, face;
-			int32_t             luma;
-			texture_parameter * texparam;
-
 			/* Skip normal */
 			input = GEO_SKIP(input, 3);
 
@@ -2362,130 +2344,111 @@ void model2_video::geo_parse_nn_s(geo_state *geo, u32 *input, u32 count)
 			point.x = u2f(GEO_NEXT(input));
 			point.y = u2f(GEO_NEXT(input));
 			point.pz = u2f(GEO_NEXT(input));
+			xform_pt(point);
+			p2 = point;
 
-			/* transform with the current matrix */
-			transform_point(&point, geo->matrix);
-
-			/* save for normal calculation */
-			p2.x = point.x; p2.y = point.y; p2.pz = point.pz;
-
-			/* compute the normal */
+			/* compute the normal and normalize it */
 			vector_cross3(&normal, &p0, &p1, &p2);
-
-			/* normalize it */
 			normalize_vector(&normal);
 
-			/* calculate the dot product of the normal and the light vector */
-			dotl = dot_product(normal, geo->light);
-
-			/* calculate the dot product of the normal and the point */
-			dotp = dot_product(normal, point);
+			/* calculate dot products */
+			const float dotl = (normal.x * lx) + (normal.y * ly) + (normal.pz * lz);
+			const float dotp = (normal.x * point.x) + (normal.y * point.y) + (normal.pz * point.pz);
 
 			/* apply focus */
-			apply_focus(geo, &point);
+			point.x *= fx;
+			point.y *= fy;
 
-			/* determine whether this is the front or the back of the polygon */
-			face = 0x100; /* rear */
-			if (dotp >= 0) face = 0; /* front */
+			const int32_t face = (dotp >= 0.0f) ? 0 : 0x100;
+			const texture_parameter *texparam = &geo->texture_parameters[(attr >> 18) & 0x1f];
 
-			/* get the texture parameters */
-			texparam = &geo->texture_parameters[(attr>>18) & 0x1f];
+			float luminance = ((dotl * dotp) < 0.0f) ? 0.0f : fabsf(dotl);
 
-			/* calculate luminance and specular */
-			if ((dotl * dotp) < 0) luminance = 0;
-			else luminance = fabs(dotl);
-
-			specular = ((2*dotl) * normal.pz) - geo->light.pz;
-			if (specular < 0) specular = 0;
-			if (texparam->specular_control == 0) specular = 0;
+			float specular = ((2.0f * dotl) * normal.pz) - lz;
+			if (specular < 0.0f) specular = 0.0f;
+			if (texparam->specular_control == 0) specular = 0.0f;
 			if ((texparam->specular_control >> 1) != 0) specular *= specular;
 			if ((texparam->specular_control >> 2) != 0) specular *= specular;
-			if (((texparam->specular_control+1) >> 3) != 0) specular *= specular;
+			if (((texparam->specular_control + 1) >> 3) != 0) specular *= specular;
 
 			specular *= texparam->specular_scale;
 
 			luminance = (luminance * texparam->diffuse) + texparam->ambient + specular;
 			luminance = std::clamp(luminance, 0.0f, 255.0f);
+			const int32_t luma = (int32_t)luminance + face;
 
-			luma = (int32_t)luminance;
+			const float coef = geo->coef_table[attr >> 27];
+			const float distance = coef * fabsf(dotp) * lod;
 
-			/* add the face bit to the luma */
-			luma += face;
-
-			/* extract distance coefficient */
-			coef = geo->coef_table[attr>>27];
-
-			/* calculate texture level of detail */
-			distance = coef * fabs(dotp) * geo->lod;
-
-			/* push to the 3d rasterizer */
-			model2_3d_push(raster, luma << 15);
-			model2_3d_push(raster, f2u(distance) >> 8);
-			model2_3d_push(raster, f2u(point.x) >> 8);
-			model2_3d_push(raster, f2u(point.y) >> 8);
-			model2_3d_push(raster, f2u(point.pz) >> 8);
-
-			/* if it's a quad, push one more point */
-			if (attr & 1)
-			{
-				/* read in the next point */
-				point.x = u2f(GEO_NEXT(input));
-				point.y = u2f(GEO_NEXT(input));
-				point.pz = u2f(GEO_NEXT(input));
-
-				/* transform with the current matrix */
-				transform_point(&point, geo->matrix);
-
-				/* save for normal calculation */
-				p3.x = point.x; p3.y = point.y; p3.pz = point.pz;
-
-				/* apply focus */
-				apply_focus(geo, &point);
-
-				/* push to the 3d rasterizer */
+			if (direct) {
+				cb[8] = attr_masked;
+				cb[9] = luma << 15;
+				cb[10] = f2u(distance) >> 8;
+				cb[11] = f2u(point.x) >> 8;
+				cb[12] = f2u(point.y) >> 8;
+				cb[13] = f2u(point.pz) >> 8;
+				if (attr & 1) {
+					point.x = u2f(GEO_NEXT(input));
+					point.y = u2f(GEO_NEXT(input));
+					point.pz = u2f(GEO_NEXT(input));
+					xform_pt(point);
+					p3 = point;
+					point.x *= fx; point.y *= fy;
+					cb[14] = f2u(point.x) >> 8;
+					cb[15] = f2u(point.y) >> 8;
+					cb[16] = f2u(point.pz) >> 8;
+					model2_3d_process_polygon<4>(raster, attr_masked);
+				} else {
+					input = GEO_SKIP(input, 3);
+					p3 = p2;
+					model2_3d_process_polygon<3>(raster, attr_masked);
+				}
+			} else {
+				model2_3d_push(raster, attr_masked);
+				model2_3d_push(raster, luma << 15);
+				model2_3d_push(raster, f2u(distance) >> 8);
 				model2_3d_push(raster, f2u(point.x) >> 8);
 				model2_3d_push(raster, f2u(point.y) >> 8);
 				model2_3d_push(raster, f2u(point.pz) >> 8);
-			}
-			else
-			{
-				/* skip the next 3 points */
-				input = GEO_SKIP(input, 3);
-
-				/* for triangles, the rope of P1(n) is achieved by P0(n-1) (linktype 3) */
-				p3.x = p2.x; p3.y = p2.y; p3.pz = p2.pz;
+				if (attr & 1) {
+					point.x = u2f(GEO_NEXT(input));
+					point.y = u2f(GEO_NEXT(input));
+					point.pz = u2f(GEO_NEXT(input));
+					xform_pt(point);
+					p3 = point;
+					point.x *= fx; point.y *= fy;
+					model2_3d_push(raster, f2u(point.x) >> 8);
+					model2_3d_push(raster, f2u(point.y) >> 8);
+					model2_3d_push(raster, f2u(point.pz) >> 8);
+				} else {
+					input = GEO_SKIP(input, 3);
+					p3 = p2;
+				}
 			}
 		}
 		else /* we're done */
 		{
-			break;
+			if (direct)
+				raster->cur_command = 0;
+			else
+				model2_3d_push(raster, attr_masked);
+			return;
 		}
 
 		/* link type */
-		switch ((attr>>8) & 3)
+		switch ((attr >> 8) & 3)
 		{
 			case 0:
 			case 2:
-			{
-				/* reuse P0(n) and P1(n) */
-				p0.x = p2.x; p0.y = p2.y; p0.pz = p2.pz;
-				p1.x = p3.x; p1.y = p3.y; p1.pz = p3.pz;
-			}
-			break;
-
+				p0 = p2;
+				p1 = p3;
+				break;
 			case 1:
-			{
-				/* reuse P0(n-1) and P0(n) */
-				p1.x = p2.x; p1.y = p2.y; p1.pz = p2.pz;
-			}
-			break;
-
+				p1 = p2;
+				break;
 			case 3:
-			{
-				/* reuse P1(n-1) and P1(n) */
-				p0.x = p3.x; p0.y = p3.y; p0.pz = p3.pz;
-			}
-			break;
+				p0 = p3;
+				break;
 		}
 	}
 
