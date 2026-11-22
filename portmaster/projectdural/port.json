@@ -8,8 +8,10 @@
   "items_opt": [],
   "attr": {
     "title": "ProjectDural (Virtua Fighter 2)",
-    "porter": "ProjectDural",
-    "desc": "Native ARM64 / OpenGL ES 2.0 handheld port of vf2-recomp (Sega Model 2A static recompilation for Virtua Fighter 2 v2.1) with on-device SLJIT ARM64 JIT recompilation, 3:2 widescreen support, decoupled 68000+SCSP sound core, and secrets/cheats. Engineered for Anbernic RG34XX (Allwinner H700 / Mali-G31).",
+    "porter": [
+      "DanimanX"
+    ],
+    "desc": "Native ARM64 / OpenGL ES 2.0 handheld port of vf2-recomp (Sega Model 2A static recompilation for Virtua Fighter 2 v2.1) with on-device SLJIT ARM64 JIT recompilation, hardware GLES 2.0 3D renderer, 3:2 widescreen support, decoupled Core 2 68000+SCSP sound core, and secrets/cheats. Engineered for full-speed 57.5 FPS on Anbernic RG34XX (Allwinner H700 / Mali-G31).",
     "desc_md": null,
     "inst": "1. Copy your own legal MAME vf2.zip (Version 2.1) into ports/projectdural/roms/vf2.zip.\n2. Launch Virtua Fighter 2.sh — SLJIT recompiles the i960 program to native ARM64 automatically on startup (no PC pre-build required!).\n3. Press Start+Select (or Menu) in-game for Display, Audio, Secrets (Dural/MUE/KOJAC), Random Fighters, Fight Switches, and Controls.",
     "inst_md": null,

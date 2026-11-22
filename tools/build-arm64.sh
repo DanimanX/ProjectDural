@@ -281,11 +281,24 @@ cp third_party/sljit/LICENSE "$OUT/projectdural/licenses/SLJIT-BSD2.txt"
 cp "$DEPS/sdl2-src/SDL2-$SDL_VER/LICENSE.txt" "$OUT/projectdural/licenses/SDL2-LICENSE.txt"
 [ -f "$EXTERN/imgui/LICENSE.txt" ] && cp "$EXTERN/imgui/LICENSE.txt" "$OUT/projectdural/licenses/DearImGui-LICENSE.txt"
 [ -f "$ZLIB_DIR/LICENSE" ] && cp "$ZLIB_DIR/LICENSE" "$OUT/projectdural/licenses/zlib-LICENSE.txt"
-cp README.md "$OUT/projectdural/README.md"
+cp portmaster/projectdural/README.md "$OUT/projectdural/README.md"
 
 if command -v zip >/dev/null 2>&1; then
     (cd "$OUT" && zip -qr9 "$ZIPOUT" *.sh projectdural)
 else
     python3 -c "import shutil; shutil.make_archive('${ZIPOUT%.zip}', 'zip', '$OUT')"
 fi
+cp "$ZIPOUT" "$PWD/dist/projectdural.zip"
+
+# Also stage ready-to-submit PortMaster-New PR directory layout (ports/projectdural/)
+PM_PR="$PWD/dist/PortMaster-New-PR/ports/projectdural"
+rm -rf "$PM_PR"
+mkdir -p "$PM_PR"
+cp -r "$OUT/"* "$PM_PR/"
+cp portmaster/projectdural/port.json "$PM_PR/port.json"
+cp portmaster/projectdural/gameinfo.xml "$PM_PR/gameinfo.xml"
+cp portmaster/projectdural/README.md "$PM_PR/README.md"
+
 echo "Packaged: $ZIPOUT ($(du -h "$ZIPOUT" | cut -f1))"
+echo "Packaged: $PWD/dist/projectdural.zip"
+echo "Staged PortMaster-New PR tree: $PM_PR"
