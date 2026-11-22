@@ -185,7 +185,7 @@ printf '%s\n' "${RT_SRCS[@]}" | xargs -P "$JOBS" -I{} sh -c '
         src/machine/model2_video.cpp|src/machine/model2_smooth.cpp) extra="-O3 -fno-math-errno -ffp-contract=fast" ;;
         *) extra="-O3 -fno-math-errno" ;;
     esac
-    exec "$3" c++ '"$CXX_FLAGS"' $extra -c "$src" -o "$out"
+    exec "$3" c++ '"$CXX_FLAGS"' $extra -flto=thin -c "$src" -o "$out"
 ' _ {} "$BDIR/rt" "$ZIG_BIN"
 rm -f "$BDIR/libruntime.a"
 "$ZIG_BIN" ar rcs "$BDIR/libruntime.a" "$BDIR/rt"/*.o "$BDIR/sljitLir.o"
@@ -236,7 +236,7 @@ PYEOF
 "$ZIG_BIN" cc -target "$TARGET_TRIPLE" -shared -Wl,-soname,libSDL2-2.0.so.0 \
     -o "$BDIR/libSDL2-2.0.so.0" "$BDIR/sdl2_stub.c"
 
-"$ZIG_BIN" c++ -target "$TARGET_TRIPLE" -mcpu="$TARGET_CPU" -O2 -fno-fast-math -ffp-contract=off \
+"$ZIG_BIN" c++ -target "$TARGET_TRIPLE" -mcpu="$TARGET_CPU" -O3 -flto=thin -fno-fast-math -ffp-contract=off \
     -o "$BDIR/vf2.aarch64" \
     "$BDIR/obj"/*.o \
     "$BDIR/libruntime.a" "$BDIR/libimgui.a" "$BDIR/libz.a" \

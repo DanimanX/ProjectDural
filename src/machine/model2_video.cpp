@@ -1283,11 +1283,15 @@ void model2_video::vertical_sync_w(u16 data)
 /* 3D Rasterizer projection: projects a polygon into screen coordinates */
 inline void model2_video::model2_3d_project(polygon *poly)
 {
-	for (int i = 0; i < poly->num_vertices; i++)
+	const float cx = float(m_crtc_xoffset + m_ext) + poly->center[0];
+	const float cy = float(384 - poly->center[1] + m_crtc_yoffset);
+	const int n = poly->num_vertices;
+	for (int i = 0; i < n; i++)
 	{
-		/* project the vertices */
-		poly->v[i].x = m_crtc_xoffset + m_ext + poly->center[0] + (poly->v[i].x / (poly->v[i].pz + std::numeric_limits<float>::min()));
-		poly->v[i].y = ((384 - poly->center[1])+m_crtc_yoffset) - (poly->v[i].y / (poly->v[i].pz + std::numeric_limits<float>::min()));
+		/* project the vertices with a single reciprocal */
+		const float oopz = 1.0f / (poly->v[i].pz + std::numeric_limits<float>::min());
+		poly->v[i].x = cx + (poly->v[i].x * oopz);
+		poly->v[i].y = cy - (poly->v[i].y * oopz);
 	}
 }
 
@@ -1383,8 +1387,10 @@ void model2_video::build_gpu_polys(raster_state *raster, std::vector<gpu3d_poly>
 	const rectangle cliprect(0, 495 + 2 * m_ext, 0, 383);
 	const int xoffs = m_renderer->xoffs() + m_ext;
 	const int yoffs = m_renderer->yoffs();
-	out.clear();
-	out.reserve(raster->poly_list_index);
+	const int total = raster->poly_list_index;
+	out.resize(total);
+	gpu3d_poly * __restrict dst = out.data();
+	int written = 0;
 	for (int window = raster->cur_window; window >= 0; window--)
 	{
 		for (int l2 = 0; l2 < 16; ++l2)
@@ -1406,7 +1412,7 @@ void model2_video::build_gpu_polys(raster_state *raster, std::vector<gpu3d_poly>
 					{
 						if (poly->window == window)
 						{
-							gpu3d_poly &g = out.emplace_back();
+							gpu3d_poly &g = dst[written++];
 							const int n = poly->num_vertices;
 							g.n = uint8_t(n);
 							const float cx = float(m_crtc_xoffset + m_ext) + poly->center[0];
@@ -1459,11 +1465,12 @@ void model2_video::build_gpu_polys(raster_state *raster, std::vector<gpu3d_poly>
 							} else {
 								for (int i = 0; i < n; i++) {
 									const float ooz = 1.0f / (poly->v[i].pz + std::numeric_limits<float>::min());
+									const float ooz8 = ooz * 0.125f;
 									g.x[i] = cx + (poly->v[i].x * ooz);
 									g.y[i] = cy - (poly->v[i].y * ooz);
 									g.z[i] = ooz;
-									g.u[i] = poly->v[i].pu * ooz * (1.0f / 8.0f);
-									g.v[i] = poly->v[i].pv * ooz * (1.0f / 8.0f);
+									g.u[i] = poly->v[i].pu * ooz8;
+									g.v[i] = poly->v[i].pv * ooz8;
 								}
 								g.pal = pal ? u16(pal & 0x7fff) : u16(m_palram[colorbase + 0x1000] & 0x7fff);
 								g.lumabase = u16(lumabase);
@@ -1490,6 +1497,7 @@ void model2_video::build_gpu_polys(raster_state *raster, std::vector<gpu3d_poly>
 			}
 		}
 	}
+	out.resize(written);
 }
 
 // A raster's sorted polygons projected and set up for drawing, in MAME's order
