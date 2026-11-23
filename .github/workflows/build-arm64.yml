@@ -98,10 +98,19 @@ jobs:
           else
             cat dist/notes-tail.md > dist/release-notes.md
           fi
+          TITLE="ProjectDural $TAG (ARM64 PortMaster)"
           if gh release view "$TAG" >/dev/null 2>&1; then
+            # Re-running on a tag that already has a release: replace the assets, then force the
+            # release back to published with the current notes and title. This is not cosmetic --
+            # deleting a tag (the way a release is rebuilt onto a new commit) makes GitHub turn
+            # the orphaned release into a DRAFT, and an upload alone leaves it that way: v1.0.3
+            # was rebuilt with the right binary and still invisible as Latest until the draft was
+            # published by hand. --latest also matters, since a draft published later keeps an
+            # older created_at and would otherwise not outrank the previous release.
             gh release upload "$TAG" $FILES --clobber
-          else
-            gh release create "$TAG" $FILES \
-              --title "ProjectDural $TAG (ARM64 PortMaster)" \
+            gh release edit "$TAG" --draft=false --latest --title "$TITLE" \
               --notes-file dist/release-notes.md
+          else
+            gh release create "$TAG" $FILES --title "$TITLE" \
+              --notes-file dist/release-notes.md --latest
           fi
