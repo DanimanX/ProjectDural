@@ -38,15 +38,17 @@ Sega Model 2A runs Virtua Fighter 2 at a native arcade frame rate of **57.524 FP
 | **CPU Software Rasterizer (`model2_video` fallback)** | ~35 – 65 ms | ~3.5 – 5.0 ms | — | ~15 – 28 FPS *(diagnostic fallback only)* |
 
 ### Tested Devices (Real Hardware)
-Measured on retail handhelds with the PortMaster `aarch64` build. The arcade frame rate is `57.524 FPS` (100% speed); `~40 FPS` is about 70% of that.
+Measured on retail handhelds with the PortMaster `aarch64` build. The arcade frame rate is `57.524 FPS` (100% speed).
 
 | Device | SoC | GPU | GPU module (GLES driver) | OS / CFW | Tested performance |
 |---|---|---|---|---|---|
 | **Anbernic RG34XX** | Allwinner H700 (4× Cortex-A53 @ 1.5 GHz) | ARM Mali-G31 MP2 | `libmali.so` (ARM Bifrost userspace blob) + `mali_kbase` kernel module | **Knulli** | **57.52 FPS — full speed** |
 | **Powkiddy RGB30** | Rockchip RK3566 (4× Cortex-A55 @ 1.8 GHz) | ARM Mali-G52 2EE | `libmali.so` (ARM Bifrost G52 userspace blob) + `mali_kbase` kernel module | **ArkOS** | **57.52 FPS — full speed** |
-| **TrimUI Smart Pro** | Allwinner A133P (4× Cortex-A53 @ 1.8 GHz) | Imagination PowerVR GE8300 | `libGLESv2.so` + `libsrv_um.so` (Imagination PowerVR userspace) + `pvrsrvkm` kernel module | **TrimUI stock OS** | **~40 FPS — ~70% of arcade speed** |
+| **TrimUI Smart Pro** | Allwinner A133P (4× Cortex-A53 @ 1.8 GHz) | Imagination PowerVR GE8300 | `libGLESv2.so` + `libsrv_um.so` (Imagination PowerVR userspace) + `pvrsrvkm` kernel module | **Spruce** | **50–56 FPS** with all 4 cores online (see note) |
 
-The two Mali (Bifrost) handhelds hold the game at its native `57.52 FPS`; the TrimUI Smart Pro's A133P / PowerVR GE8300 combination is the slowest of the three and settles around `40 FPS`, so its fights run below arcade pacing rather than dropping frames or falling back to the CPU rasterizer.
+The two Mali (Bifrost) handhelds hold the game at its native `57.52 FPS`. The TrimUI Smart Pro's A133P / PowerVR GE8300 is the slowest of the three, settling at `50–56 FPS`, so its fights run a little below arcade pacing.
+
+> **TrimUI Smart Pro on Spruce: cores 1–2 are hotplugged off.** Spruce boots with `online: 0,3`, and the port's threads are pinned to cores 0–3 by role (main / emulation / sound / audio). When a pinned core does not exist the pin fails silently and every thread collapses onto core 0 — the whole 4-thread pipeline then shares one CPU and the game measured **26–28 FPS**. The launcher now brings cores 1–2 up for the session (and puts them back afterwards), and the binary resolves each role against the cores actually online, so the same hardware reaches **50–56 FPS**. If you see roughly half speed, check `cat /sys/devices/system/cpu/online` — it should be `0-3` while the port runs.
 
 ### Compatible Handhelds
 Compiled for **`aarch64-linux-gnu` / `glibc <= 2.28`** (statically linking `libc++` and `zlib 1.3.1` via Zig, dynamically loading the firmware's hardware-accelerated `libSDL2-2.0.so.0` and OpenGL ES 2.0):

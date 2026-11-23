@@ -45,6 +45,7 @@ namespace {
 constexpr int kMainCore = 0;
 constexpr int kEmuCore = 1;
 constexpr int kSoundCore = 2;
+constexpr int kAudioCore = 3;
 
 uint64_t ticks_us() {
     struct timespec ts {};
@@ -126,10 +127,20 @@ public:
 
     double last_emu_ms() const { return last_emu_ms_.load(std::memory_order_relaxed); }
 
+    // Timeline marks of this thread's last run, for DURAL_TIMELINE. Read once the run is
+    // known to be over (after wait_frame), so they describe one frame and never tear.
+    struct Marks { uint64_t start = 0, wait_begin = 0, wait_end = 0, end = 0; };
+    Marks marks() const {
+        return {tl_start_.load(std::memory_order_relaxed), tl_wait_begin_.load(std::memory_order_relaxed),
+                tl_wait_end_.load(std::memory_order_relaxed), tl_end_.load(std::memory_order_relaxed)};
+    }
+
 private:
     void wait_render_done() {
+        tl_wait_begin_.store(ticks_us(), std::memory_order_relaxed);
         std::unique_lock<std::mutex> lk(mu_);
         render_cv_.wait(lk, [&] { return !render_busy_ || stop_; });
+        tl_wait_end_.store(ticks_us(), std::memory_order_relaxed);
     }
 
     void loop() {
@@ -142,8 +153,13 @@ private:
                 if (stop_) return;
             }
             const uint64_t t0 = ticks_us();
+            tl_wait_begin_.store(0, std::memory_order_relaxed);
+            tl_wait_end_.store(0, std::memory_order_relaxed);
+            tl_start_.store(t0, std::memory_order_relaxed);
             game_->run_frame();
-            const double ms = double(ticks_us() - t0) / 1000.0;
+            const uint64_t t1 = ticks_us();
+            tl_end_.store(t1, std::memory_order_relaxed);
+            const double ms = double(t1 - t0) / 1000.0;
             last_emu_ms_.store(ms, std::memory_order_relaxed);
             {
                 std::lock_guard<std::mutex> lk(mu_);
@@ -162,6 +178,7 @@ private:
     bool busy_ = false;
     bool render_busy_ = false;
     std::atomic<double> last_emu_ms_{0.0};
+    std::atomic<uint64_t> tl_start_{0}, tl_wait_begin_{0}, tl_wait_end_{0}, tl_end_{0};
 };
 
 void ensure_dir(const std::string &path) {
@@ -644,11 +661,38 @@ int main(int argc, char **argv) {
         else if (a == "--bench-gles" && i + 1 < argc) cli.bench_gles = std::max(1, std::atoi(argv[++i]));
     }
 
-    arm64::pin_current_thread(kMainCore);
+    // The 4-thread pipeline below assumes cores 0..3 are all up. Some firmwares boot with
+    // cores hotplugged off (Spruce on the TrimUI: `online: 0,3`), which silently collapsed
+    // every thread onto core 0 -- ~27 FPS instead of ~52. Resolve each role onto a core that
+    // is actually online, keep them distinct, and say so when the plan had to change.
+    const int kRoles[4] = {kMainCore, kEmuCore, kSoundCore, kAudioCore};
+    int role_core[4] = {-1, -1, -1, -1};
+    for (int r = 0; r < 4; ++r) {
+        int avoid[4], avoid_n = 0;
+        for (int q = 0; q < r; ++q)
+            if (role_core[q] >= 0) avoid[avoid_n++] = role_core[q];
+        role_core[r] = arm64::resolve_core(kRoles[r], avoid, avoid_n);
+        // Nothing free: the main thread leaves its affinity alone; a worker falls back to
+        // core 0, which at least keeps it running rather than unpinned across cores.
+        if (role_core[r] < 0 && r > 0) role_core[r] = 0;
+    }
+    if (arm64::cpu_count() < 4)
+        std::fprintf(stderr,
+                     "[ProjectDural] only %d core(s) online (cores 1-2 hotplugged off?): "
+                     "the pipeline will share CPUs and run well below the intended frame rate.\n",
+                     arm64::cpu_count());
+    std::fprintf(stderr, "[ProjectDural] cores online=%d | main=%d emu=%d snd=%d audio=%d\n",
+                 arm64::cpu_count(), role_core[0], role_core[1], role_core[2], role_core[3]);
+
+    arm64::pin_current_thread(role_core[0]);
     arm64::set_current_thread_name("dural-main");
     setenv("VF2_THREADS", "2", 0);
 #if defined(__aarch64__)
-    setenv("VF2_WORKER_CORE", "3", 0);
+    {
+        char core_str[8];
+        std::snprintf(core_str, sizeof core_str, "%d", std::max(role_core[3], 0));
+        setenv("VF2_WORKER_CORE", core_str, 0);
+    }
 #endif
 
     if (cli.bench_synthetic > 0) return run_synthetic_bench(cli.bench_synthetic);
@@ -754,7 +798,7 @@ int main(int argc, char **argv) {
     }
 
     arm64::SoundWorker sound_worker;
-    sound_worker.set_core(kSoundCore);
+    sound_worker.set_core(std::max(role_core[2], 0));
     sound_worker.open(roms, audio_ok ? &audio : nullptr);
 
     std::unique_ptr<model2a> game = std::make_unique<model2a>(std::move(roms), !cli.interp);
@@ -808,7 +852,7 @@ int main(int argc, char **argv) {
     };
 
     restart_game(true);
-    emu_worker.open(game.get(), kEmuCore);
+    emu_worker.open(game.get(), std::max(role_core[1], 0));
 
     enum class MenuPage { Main, Display, Audio, Arcade, Cheats, Controls };
     bool running = true;
@@ -866,6 +910,21 @@ int main(int argc, char **argv) {
     };
     if (autobench_step >= 0) apply_bench_step(autobench_step++);
 
+    // DURAL_TIMELINE=1: one line per frame, all times in ms relative to that frame's start.
+    // The averages in [perf] cannot say whether the emulation thread and the GL submit
+    // overlap; this can. Read-only: it records the timestamps the loop already takes and
+    // prints them. Only frames heavy enough to matter are printed (a fight, not a logo),
+    // so the capture does not depend on timing a menu.
+    const bool timeline_on = std::getenv("DURAL_TIMELINE") != nullptr;
+    const int kTimelineFrames = 60;
+    const size_t kTimelineMinPolys = 700;
+    int tl_printed = 0;
+    struct FrameTrace {
+        uint64_t loop0 = 0, wait_emu = 0, parts_done = 0, draw_done = 0, swap_done = 0;
+        size_t polys = 0;
+        bool valid = false;
+    } pending;
+
     while (running) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
@@ -902,6 +961,7 @@ int main(int argc, char **argv) {
         menu_latch = chord_now;
 
         if (!menu_open) {
+            const uint64_t t_loop0 = ticks_us();
             uint8_t in0 = 0xff, in1 = 0xff, in2 = 0xff;
             const bool sys_combo = (p0_btns & arm64::Select) != 0;
             if (sys_combo && (p0_btns & arm64::BtnY)) in0 &= ~arm64::IN0_TEST;
@@ -927,6 +987,30 @@ int main(int argc, char **argv) {
             // Wait for Core 1 to complete the current frame's CPU emulation
             emu_worker.wait_frame();
             last_emu_ms = emu_worker.last_emu_ms();
+            const uint64_t t_wait_emu = ticks_us();
+
+            // The emu marks that just became final belong to the run launched while the
+            // previous frame was being drawn: print them beside that frame's spans.
+            if (timeline_on && pending.valid && tl_printed < kTimelineFrames &&
+                pending.polys >= kTimelineMinPolys) {
+                const EmuWorker::Marks m = emu_worker.marks();
+                const double base = double(int64_t(pending.loop0));
+                auto rel = [base](uint64_t t) { return t ? (double(int64_t(t)) - base) / 1000.0 : 0.0; };
+                ++tl_printed;
+                std::fprintf(stderr,
+                    "[tl] %2d polys=%4zu | main: pre=%5.2f parts=%5.2f draw=%6.2f swap=%6.2f loop=%6.2f | "
+                    "emu: start=%6.2f wbeg=%6.2f wdur=%5.2f end=%6.2f dur=%6.2f | gap=%5.2f\n",
+                    tl_printed, pending.polys,
+                    double(pending.wait_emu - pending.loop0) / 1000.0,
+                    double(pending.parts_done - pending.wait_emu) / 1000.0,
+                    double(pending.draw_done - pending.parts_done) / 1000.0,
+                    double(pending.swap_done - pending.draw_done) / 1000.0,
+                    double(pending.swap_done - pending.loop0) / 1000.0,
+                    rel(m.start), rel(m.wait_begin),
+                    (m.wait_end > m.wait_begin) ? double(m.wait_end - m.wait_begin) / 1000.0 : 0.0,
+                    rel(m.end), (m.end > m.start) ? double(m.end - m.start) / 1000.0 : 0.0,
+                    double(int64_t(t_loop0) - int64_t(pending.swap_done)) / 1000.0);
+            }
 
             if (!uart_bytes.empty()) {
                 sound_worker.push_uart(uart_bytes.data(), uart_bytes.size());
@@ -984,10 +1068,14 @@ int main(int argc, char **argv) {
                 ImGui::End();
                 imgui.render();
             }
+            const uint64_t t_draw_done = ticks_us();
             const uint64_t t_swap0 = ticks_us();
             arm64::gl_end_frame();
             const uint64_t now = ticks_us();
             last_swap_ms = double(now - t_swap0) / 1000.0;
+
+            pending = {t_loop0, t_wait_emu, t_parts1, t_draw_done, now,
+                       gpu.last_poly_count(), true};
 
             ++fps_frames;
             ++log_frames;
