@@ -73,25 +73,35 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           FILES="dist/ProjectDural-PortMaster-aarch64.zip dist/ProjectDural-PortMaster-aarch64.zip.sha256"
-          cat > dist/release-notes.md <<'EOF'
-          Automated ROM-free AArch64 / OpenGL ES 2.0 / SLJIT PortMaster build of **ProjectDural** tuned for Anbernic RG34XX (Allwinner H700) and compatible ARM64 Linux handhelds.
+          # Per-release highlights live in docs/release-notes/<tag>.md and are prepended to the
+          # notes every release shares. A tag without its own file still gets the common part,
+          # so publishing never depends on remembering to write one.
+          cat > dist/notes-tail.md <<'EOF'
+          Automated ROM-free AArch64 / OpenGL ES 2.0 / SLJIT PortMaster build of **ProjectDural**, for Anbernic RG34XX / Allwinner H700 (Mali-G31) and compatible ARM64 Linux handhelds, including the Powkiddy RGB30 (Mali-G52) and TrimUI Smart Pro (PowerVR GE8300).
 
           ### Contents (Zero ROMs / Zero Game Code)
-          - `Virtua Fighter 2.sh` (PortMaster launcher with `performance` CPU governor)
+          - `Virtua Fighter 2.sh` (PortMaster launcher: starts the cores the 4-thread pipeline needs, pins the CPU governor to `performance`, prints a `[sys]` hardware line to `log.txt`)
           - `projectdural/vf2.aarch64` (ARM64 Cortex-A53, SLJIT ARM64 i960 JIT, Core 2 SCSP sound worker, OpenGL ES 2.0, ARM64 NEON, max `GLIBC_2.28`, statically linked `zlib` & `libc++`)
           - `projectdural/assets/backgrounds/select.png` (painted 3:2 character select sides, CC BY 4.0)
-          - `projectdural/gamecontrollerdb.txt` (includes Anbernic RG34XX mapping), PortMaster metadata, and licences
+          - `projectdural/gamecontrollerdb.txt`, PortMaster metadata, and licences
 
           ### Quick Setup (BYOD)
           1. Extract `ProjectDural-PortMaster-aarch64.zip` into your handheld's `ports/` folder.
           2. Copy your own legal MAME `vf2.zip` (Version 2.1) into `ports/projectdural/roms/vf2.zip`.
           3. Launch **Virtua Fighter 2** — SLJIT compiles the i960 program to native ARM64 automatically on startup (no PC pre-build required!).
+
+          Report issues at https://github.com/DanimanX/ProjectDural/issues — `ports/projectdural/log.txt` plus the `[sys]` and `[perf]` lines there make a performance report actionable.
           EOF
-          sed -i 's/^          //' dist/release-notes.md
+          sed -i 's/^          //' dist/notes-tail.md
+          if [ -f "docs/release-notes/$TAG.md" ]; then
+            cat "docs/release-notes/$TAG.md" dist/notes-tail.md > dist/release-notes.md
+          else
+            cat dist/notes-tail.md > dist/release-notes.md
+          fi
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" $FILES --clobber
           else
             gh release create "$TAG" $FILES \
-              --title "ProjectDural $TAG (ARM64 / Anbernic RG34XX PortMaster)" \
+              --title "ProjectDural $TAG (ARM64 PortMaster)" \
               --notes-file dist/release-notes.md
           fi
