@@ -69,12 +69,20 @@ inline constexpr GLenum GL_FRAGMENT_SHADER = 0x8B30u;
 inline constexpr GLenum GL_VERTEX_SHADER = 0x8B31u;
 inline constexpr GLenum GL_COMPILE_STATUS = 0x8B81u;
 inline constexpr GLenum GL_LINK_STATUS = 0x8B82u;
+inline constexpr GLenum GL_FRAMEBUFFER = 0x8D40u;
+inline constexpr GLenum GL_RENDERBUFFER = 0x8D41u;
+inline constexpr GLenum GL_COLOR_ATTACHMENT0 = 0x8CE0u;
+inline constexpr GLenum GL_DEPTH_ATTACHMENT = 0x8D00u;
+inline constexpr GLenum GL_FRAMEBUFFER_COMPLETE = 0x8CD5u;
+inline constexpr GLenum GL_DEPTH_COMPONENT16 = 0x81A5u;
 
 #define ARM64_GL_FUNCS(X) \
     X(void, glActiveTexture, (GLenum)) \
     X(void, glAttachShader, (GLuint, GLuint)) \
     X(void, glBindAttribLocation, (GLuint, GLuint, const GLchar *)) \
     X(void, glBindBuffer, (GLenum, GLuint)) \
+    X(void, glBindFramebuffer, (GLenum, GLuint)) \
+    X(void, glBindRenderbuffer, (GLenum, GLuint)) \
     X(void, glBindTexture, (GLenum, GLuint)) \
     X(void, glBlendFunc, (GLenum, GLenum)) \
     X(void, glBufferData, (GLenum, GLsizeiptr, const void *, GLenum)) \
@@ -85,6 +93,8 @@ inline constexpr GLenum GL_LINK_STATUS = 0x8B82u;
     X(GLuint, glCreateProgram, (void)) \
     X(GLuint, glCreateShader, (GLenum)) \
     X(void, glDeleteBuffers, (GLsizei, const GLuint *)) \
+    X(void, glDeleteFramebuffers, (GLsizei, const GLuint *)) \
+    X(void, glDeleteRenderbuffers, (GLsizei, const GLuint *)) \
     X(void, glDeleteProgram, (GLuint)) \
     X(void, glDeleteShader, (GLuint)) \
     X(void, glDeleteTextures, (GLsizei, const GLuint *)) \
@@ -97,7 +107,12 @@ inline constexpr GLenum GL_LINK_STATUS = 0x8B82u;
     X(void, glEnable, (GLenum)) \
     X(void, glEnableVertexAttribArray, (GLuint)) \
     X(void, glFinish, (void)) \
+    X(void, glFramebufferRenderbuffer, (GLenum, GLenum, GLenum, GLuint)) \
+    X(void, glFramebufferTexture2D, (GLenum, GLenum, GLenum, GLuint, GLint)) \
+    X(GLenum, glCheckFramebufferStatus, (GLenum)) \
     X(void, glGenBuffers, (GLsizei, GLuint *)) \
+    X(void, glGenFramebuffers, (GLsizei, GLuint *)) \
+    X(void, glGenRenderbuffers, (GLsizei, GLuint *)) \
     X(void, glGenTextures, (GLsizei, GLuint *)) \
     X(GLenum, glGetError, (void)) \
     X(void, glGetProgramInfoLog, (GLuint, GLsizei, GLsizei *, GLchar *)) \
@@ -108,6 +123,7 @@ inline constexpr GLenum GL_LINK_STATUS = 0x8B82u;
     X(GLint, glGetUniformLocation, (GLuint, const GLchar *)) \
     X(void, glLinkProgram, (GLuint)) \
     X(void, glPixelStorei, (GLenum, GLint)) \
+    X(void, glRenderbufferStorage, (GLenum, GLenum, GLsizei, GLsizei)) \
     X(void, glScissor, (GLint, GLint, GLsizei, GLsizei)) \
     X(void, glShaderSource, (GLuint, GLsizei, const GLchar *const *, const GLint *)) \
     X(void, glTexImage2D, (GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *)) \

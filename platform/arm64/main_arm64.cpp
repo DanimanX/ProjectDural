@@ -27,6 +27,7 @@
 #include <SDL.h>
 #include <algorithm>
 #include <cerrno>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -49,6 +50,16 @@ uint64_t ticks_us() {
     struct timespec ts {};
     ::clock_gettime(CLOCK_MONOTONIC, &ts);
     return uint64_t(ts.tv_sec) * 1000000ull + uint64_t(ts.tv_nsec) / 1000ull;
+}
+
+// Current core-0 clock, for the [perf] line: a device stuck in powersave shows it here.
+int cpu_mhz_now() {
+    FILE *f = std::fopen("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq", "r");
+    if (!f) return -1;
+    long khz = -1;
+    if (std::fscanf(f, "%ld", &khz) != 1) khz = -1;
+    std::fclose(f);
+    return khz > 0 ? int(khz / 1000) : -1;
 }
 
 class EmuWorker {
@@ -222,6 +233,7 @@ struct Settings {
     bool vsync = true;
     bool sync_60hz = false;         // false = 57.524 Hz arcade pacing, true = 60 Hz display sync
     bool show_fps = false;
+    int render_scale = 100;         // 3D/2D scene drawn at this % of the window, then blitted up
     int volume = 90;
     int music_volume = 100;
     int effects_volume = 100;
@@ -246,6 +258,7 @@ struct Settings {
 
     void sanitize() {
         aspect = std::clamp(aspect, 0, 2);
+        if (render_scale < 40 || render_scale > 100) render_scale = 100;
         volume = std::clamp(volume, 0, 100);
         music_volume = std::clamp(music_volume, 0, 100);
         effects_volume = std::clamp(effects_volume, 0, 100);
@@ -271,6 +284,7 @@ struct Settings {
             else if (!std::strcmp(key, "vsync")) vsync = v != 0;
             else if (!std::strcmp(key, "sync_60hz")) sync_60hz = v != 0;
             else if (!std::strcmp(key, "show_fps")) show_fps = v != 0;
+            else if (!std::strcmp(key, "render_scale")) render_scale = v;
             else if (!std::strcmp(key, "volume")) volume = v;
             else if (!std::strcmp(key, "music_volume")) music_volume = v;
             else if (!std::strcmp(key, "effects_volume")) effects_volume = v;
@@ -301,6 +315,7 @@ struct Settings {
         if (!f) return false;
         std::fprintf(f, "aspect=%d\ngpu_3d=%d\nbackdrop_filter=%d\nhide_hud=%d\nvsync=%d\nsync_60hz=%d\nshow_fps=%d\n",
                      aspect, int(gpu_3d), int(backdrop_filter), int(hide_hud), int(vsync), int(sync_60hz), int(show_fps));
+        std::fprintf(f, "render_scale=%d\n", render_scale);
         std::fprintf(f, "volume=%d\nmusic_volume=%d\neffects_volume=%d\nmute=%d\ndsp_reverb=%d\n",
                      volume, music_volume, effects_volume, int(mute), int(dsp_reverb));
         std::fprintf(f, "free_play=%d\nfast_boot=%d\ndebug_mode=%d\nsecret_char=%d\nrandom_mode=%d\n",
@@ -326,6 +341,7 @@ struct CliOptions {
     bool arcade = false;
     int bench_frames = 0;
     int bench_synthetic = 0;
+    int bench_gles = 0;
 };
 
 void print_usage(const char *prog) {
@@ -341,6 +357,7 @@ void print_usage(const char *prog) {
         "  --arcade               Authentic cabinet boot & coin mode\n"
         "  --bench-frames N       Headless benchmark using vf2.zip\n"
         "  --bench-synthetic N    ROM-free headless verification (SLJIT + SoundWorker + 3D export)\n"
+        "  --bench-gles N         ROM-free GLES render benchmark: fixed scene, N frames per config\n"
         "  --help                 Show this help message\n",
         prog);
 }
@@ -391,6 +408,121 @@ int run_synthetic_bench(int frames) {
     v.bench_export(exported);
     std::printf("[synthetic] 3D export check: %zu gpu3d_poly records ready for GLES 2.0\n", exported.size());
     return (st.native > 0 && exported.size() >= 1500) ? 0 : 1;
+}
+
+// Deterministic GLES render benchmark: the same made-up 3D scene (model2_video::bench_make)
+// and the same synthetic 2D layers every frame, drawn through the real renderer with each
+// configuration in turn. No ROM and no game state, so two runs -- or two knobs -- can be
+// compared on the device without the scene changing under the measurement. Each pass is
+// bracketed by glFinish so what is timed is the driver's work, not queue depth.
+int run_gles_bench(int frames, bool fullscreen) {
+    arm64::GlConfig gl_cfg;
+    gl_cfg.fullscreen = fullscreen;
+    gl_cfg.vsync = false;                 // the refresh rate must not cap the measure
+    if (!arm64::gl_init(gl_cfg)) {
+        std::fprintf(stderr, "OpenGL init failed: %s\n", arm64::gl_error());
+        return 1;
+    }
+    arm64::GpuGlesRenderer gpu;
+    if (!gpu.ok()) { std::fprintf(stderr, "GLES renderer unavailable\n"); arm64::gl_fini(); return 1; }
+    arm64::gl_set_vsync(false);
+
+    // The 3D: the fight-sized scene, exported once (the polygons do not change between frames).
+    static std::vector<u32> vram(0x10000, 0), tex0(0x80000, 0), tex1(0x80000, 0);
+    static std::vector<u8> luma(0x8000, 0x20), texrom(0x2000, 0), polyrom(0x2000, 0);
+    static std::vector<u16> pal(0x2000, 0x7fff), xlat(0x6000, 0xff);
+    static u8 gamma[256];
+    for (int i = 0; i < 256; ++i) gamma[i] = u8(i);
+    model2_video video(vram.data(), tex0.data(), tex1.data(), luma.data(), pal.data(), xlat.data(),
+                       gamma, texrom.data(), texrom.size(), polyrom.data(), polyrom.size());
+    video.bench_make(1500);
+    std::vector<gpu3d_poly> polys;
+    video.bench_export(polys);
+
+    gpu3d_rams rams;
+    rams.tex[0] = tex0.data();
+    rams.tex[1] = tex1.data();
+    rams.luma = luma.data();
+    rams.xlat = xlat.data();
+    rams.gamma = gamma;
+    for (int i = 0; i < 4; ++i) rams.gen[i] = 1;
+
+    // The 2D: a backdrop and two layers at a fixed size, with a little content so the textures
+    // are really uploaded and sampled (a uniform layer would let a driver skip work).
+    const int W = 496, H = 384, PAD = model2a::picture_parts::PAD;
+    std::vector<u32> backdrop(size_t(W + 2 * PAD) * size_t(H + 2 * PAD));
+    std::vector<u32> mid(size_t(W) * size_t(H)), top(size_t(W) * size_t(H));
+    for (int y = 0; y < H + 2 * PAD; ++y)
+        for (int x = 0; x < W + 2 * PAD; ++x)
+            backdrop[size_t(y) * (W + 2 * PAD) + x] =
+                0xff000000u | (u32((x * 3) & 0xff) << 16) | (u32((y * 5) & 0xff) << 8) | 0x40u;
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x) {
+            const bool on = ((x / 24) + (y / 24)) & 1;
+            mid[size_t(y) * W + x] = on ? (0xff204060u | u32(x * 2 & 0xff)) : 0u;
+            const bool hud = y < 64 || y > H - 48;
+            top[size_t(y) * W + x] = (hud && (x % 12) < 6) ? 0xffe0e0e0u : 0u;
+        }
+
+    struct Config { const char *name; bool scissor; float scale; };
+    const Config configs[] = {
+        {"scissor-per-poly  100%", true, 1.00f},
+        {"scissor-off       100%", false, 1.00f},
+        {"scissor-off        85%", false, 0.85f},
+        {"scissor-off        75%", false, 0.75f},
+        {"scissor-off        60%", false, 0.60f},
+        {"scissor-off        50%", false, 0.50f},
+    };
+    std::printf("[glesbench] %zu polygons, %dx%d display, %d frames per configuration\n",
+                polys.size(), arm64::gl_display_width(), arm64::gl_display_height(), frames);
+    for (const Config &c : configs) {
+        gpu.set_poly_scissor(c.scissor);
+        arm64::gl_set_render_scale(c.scale);
+        model2a::picture_parts parts;
+        parts.w = W;
+        parts.s = 1;
+        parts.version = 1;
+        parts.backdrop = backdrop.data();
+        parts.mid = mid.data();
+        parts.top = top.data();
+        parts.filter = false;
+        parts.gpu3d = true;
+        parts.bd_unpadded = false;
+        parts.mid_y0 = 0; parts.mid_y1 = H;
+        parts.top_y0 = 0; parts.top_y1 = H;
+
+        // Warm-up: texture uploads, shader binds, the scene target's first allocation.
+        for (int i = 0; i < 8; ++i) {
+            arm64::gl_begin_frame();
+            gpu.draw_frame(parts, W, arm64::AspectMode::Widescreen32, polys.data(), polys.size(), &rams);
+            arm64::gl_resolve_scene();
+            arm64::gl_end_frame();
+        }
+        if (auto *fn = arm64::gl_finish_ptr()) fn();
+
+        // Two passes; the second is reported, so the first absorbs any one-off cost.
+        double best[2] = {1e9, 1e9};
+        for (int pass = 0; pass < 2; ++pass) {
+            if (auto *fn = arm64::gl_finish_ptr()) fn();
+            const uint64_t t0 = ticks_us();
+            for (int i = 0; i < frames; ++i) {
+                arm64::gl_begin_frame();
+                gpu.draw_frame(parts, W, arm64::AspectMode::Widescreen32, polys.data(), polys.size(), &rams);
+                arm64::gl_resolve_scene();
+                arm64::gl_end_frame();
+            }
+            if (auto *fn = arm64::gl_finish_ptr()) fn();
+            best[pass] = double(ticks_us() - t0) / 1000.0 / double(frames);
+        }
+        const double ms = std::min(best[0], best[1]);
+        std::printf("[glesbench] %s  %6.2f ms/frame  %5.1f fps  batches=%zu polys=%zu cpu=%dMHz\n",
+                    c.name, ms, 1000.0 / std::max(ms, 0.001), gpu.last_batch_count(),
+                    gpu.last_poly_count(), cpu_mhz_now());
+        std::fflush(stdout);
+    }
+    gpu.shutdown();
+    arm64::gl_fini();
+    return 0;
 }
 
 int run_rom_bench(const std::string &rom_path, int frames, bool interp) {
@@ -509,6 +641,7 @@ int main(int argc, char **argv) {
         else if (a == "--arcade") cli.arcade = true;
         else if (a == "--bench-frames" && i + 1 < argc) cli.bench_frames = std::max(1, std::atoi(argv[++i]));
         else if (a == "--bench-synthetic" && i + 1 < argc) cli.bench_synthetic = std::max(1, std::atoi(argv[++i]));
+        else if (a == "--bench-gles" && i + 1 < argc) cli.bench_gles = std::max(1, std::atoi(argv[++i]));
     }
 
     arm64::pin_current_thread(kMainCore);
@@ -519,6 +652,7 @@ int main(int argc, char **argv) {
 #endif
 
     if (cli.bench_synthetic > 0) return run_synthetic_bench(cli.bench_synthetic);
+    if (cli.bench_gles > 0) return run_gles_bench(cli.bench_gles, cli.fullscreen);
 
     std::string data_dir = cli.data_dir.empty() ? executable_dir(argv[0]) : cli.data_dir;
     if (cli.bench_frames > 0) {
@@ -544,6 +678,7 @@ int main(int argc, char **argv) {
     arm64::GlConfig gl_cfg;
     gl_cfg.fullscreen = cli.fullscreen;
     gl_cfg.vsync = cfg.vsync;
+    arm64::gl_set_render_scale(float(cfg.render_scale) / 100.0f);
     if (!arm64::gl_init(gl_cfg)) {
         std::fprintf(stderr, "OpenGL init failed: %s\n", arm64::gl_error());
         SDL_Quit();
@@ -587,7 +722,7 @@ int main(int argc, char **argv) {
             }
             const uint32_t b0 = pads.poll_player(0, SDL_GetKeyboardState(nullptr));
             if (b0 & (arm64::BtnA | arm64::BtnB | arm64::Start | arm64::Guide)) quit = true;
-            arm64::gl_begin_frame();
+            arm64::gl_begin_frame(false); // UI only: never into the scaled scene target
             imgui.frame(1.0f / 60.0f);
             ImGui::SetNextWindowPos({float(arm64::gl_display_width()) * 0.5f, float(arm64::gl_display_height()) * 0.5f},
                                     ImGuiCond_Always, {0.5f, 0.5f});
@@ -706,6 +841,31 @@ int main(int argc, char **argv) {
     double sum_polys = 0.0, sum_batches = 0.0;
     uint32_t prev_tex_clr = gpu.last_tex_clears(), prev_pal_clr = gpu.last_pal_clears();
 
+    // DURAL_AUTOBENCH=<seconds per step>: cycles the two PowerVR-relevant knobs while the
+    // player runs a match, tagging each [perf] line with the step, so one launch yields an
+    // A/B on real hardware. Off unless the variable is set.
+    int autobench_step = -1;
+    uint64_t autobench_t0 = 0;
+    int autobench_secs = 0;
+    if (const char *ab = std::getenv("DURAL_AUTOBENCH")) {
+        autobench_secs = std::max(4, std::atoi(ab));
+        autobench_step = 0;
+        autobench_t0 = ticks_us();
+    }
+    struct BenchStep { bool scissor; int scale; };
+    const BenchStep kBench[] = {
+        {true, 100}, {false, 100}, {false, 85}, {false, 75}, {true, 75}, {false, 60},
+    };
+    const int kBenchCount = int(sizeof kBench / sizeof kBench[0]);
+    auto apply_bench_step = [&](int step) {
+        const BenchStep &b = kBench[step % kBenchCount];
+        gpu.set_poly_scissor(b.scissor);
+        arm64::gl_set_render_scale(float(b.scale) / 100.0f);
+        std::fprintf(stderr, "[bench] step=%d/%d poly_scissor=%d render_scale=%d%% cpu=%dMHz\n",
+                     step % kBenchCount + 1, kBenchCount, b.scissor ? 1 : 0, b.scale, cpu_mhz_now());
+    };
+    if (autobench_step >= 0) apply_bench_step(autobench_step++);
+
     while (running) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
@@ -715,6 +875,10 @@ int main(int argc, char **argv) {
             else pads.handle_event(e);
         }
 
+        if (autobench_step >= 0 && ticks_us() - autobench_t0 >= uint64_t(autobench_secs) * 1000000ull) {
+            autobench_t0 = ticks_us();
+            apply_bench_step(autobench_step++);
+        }
         const uint8_t *keys = SDL_GetKeyboardState(nullptr);
         const uint32_t p0_btns = pads.poll_player(0, keys);
         const uint32_t p1_btns = pads.poll_player(1, keys);
@@ -806,6 +970,7 @@ int main(int argc, char **argv) {
             } else {
                 gpu.draw_cpu_framebuffer(cpu_fb.data(), fb_w, 384, aspect_mode);
             }
+            arm64::gl_resolve_scene();
             last_gles_ms = double(ticks_us() - t_parts1) / 1000.0;
 
             if (cfg.show_fps) {
@@ -844,11 +1009,14 @@ int main(int argc, char **argv) {
                 const uint32_t tc = gpu.last_tex_clears();
                 const uint32_t pc = gpu.last_pal_clears();
                 std::fprintf(stderr,
-                             "[perf] fps=%.1f emu=%.2fms snd=%.2fms 2d_exp=%.2fms gles=%.2fms swap=%.2fms polys=%.0f batches=%.0f tex=%.1fMB tex_clr=%u pal_clr=%u\n",
+                             "[perf] fps=%.1f emu=%.2fms snd=%.2fms 2d_exp=%.2fms gles=%.2fms swap=%.2fms polys=%.0f batches=%.0f tex=%.1fMB tex_clr=%u pal_clr=%u cpu=%dMHz scale=%d%% scissor=%d upl=%.2fms sub=%.2fms\n",
                              lf, sum_emu_ms / log_frames, sum_snd_ms / log_frames, sum_parts_ms / log_frames,
                              sum_gles_ms / log_frames, sum_swap_ms / log_frames, sum_polys / log_frames, sum_batches / log_frames,
                              double(gpu.cached_tex_bytes()) / (1024.0 * 1024.0),
-                             tc - prev_tex_clr, pc - prev_pal_clr);
+                             tc - prev_tex_clr, pc - prev_pal_clr, cpu_mhz_now(),
+                             int(std::lround(arm64::gl_render_scale() * 100.0f)),
+                             gpu.poly_scissor() ? 1 : 0,
+                             arm64::gl_upload_ms(), arm64::gl_submit_ms());
                 prev_tex_clr = tc;
                 prev_pal_clr = pc;
                 log_frames = 0;
@@ -877,14 +1045,14 @@ int main(int argc, char **argv) {
             };
             if (edge & arm64::BtnB) go_back();
 
-            const int item_counts[] = {8, 7, 5, 7, 7, arm64::ActionCount + 2};
+            const int item_counts[] = {8, 8, 5, 7, 7, arm64::ActionCount + 2};
             const int n_items = item_counts[int(menu_page)];
             if (edge & arm64::Up) menu_idx = (menu_idx + n_items - 1) % n_items;
             if (edge & arm64::Down) menu_idx = (menu_idx + 1) % n_items;
             const int lr = (edge & arm64::Right) ? 1 : ((edge & arm64::Left) ? -1 : 0);
             const bool act = (edge & (arm64::BtnA | arm64::Start)) != 0;
 
-            arm64::gl_begin_frame();
+            arm64::gl_begin_frame(false); // UI only: never into the scaled scene target
             imgui.frame(1.0f / 60.0f);
             ImGui::SetNextWindowPos({float(arm64::gl_display_width()) * 0.5f, float(arm64::gl_display_height()) * 0.5f},
                                     ImGuiCond_Always, {0.5f, 0.5f});
@@ -944,6 +1112,20 @@ int main(int argc, char **argv) {
                 }
                 if (row(5, "Frame Pacing", cfg.sync_60hz ? "60.0 Hz" : "57.52 Hz Arcade")) cfg.sync_60hz = !cfg.sync_60hz;
                 if (row(6, "Show FPS / Stats", cfg.show_fps ? "ON" : "OFF")) cfg.show_fps = !cfg.show_fps;
+                {
+                    static const int kScales[] = {100, 85, 75, 60, 50};
+                    const int n_scales = int(sizeof kScales / sizeof kScales[0]);
+                    int si = 0;
+                    for (int i = 1; i < n_scales; ++i)
+                        if (std::abs(kScales[i] - cfg.render_scale) < std::abs(kScales[si] - cfg.render_scale)) si = i;
+                    char sbuf[32];
+                    std::snprintf(sbuf, sizeof sbuf, "%d%%%s", kScales[si], si == 0 ? " (native)" : "");
+                    if (row(7, "Render Scale", sbuf)) {
+                        si = (si + (lr < 0 ? n_scales - 1 : 1)) % n_scales;
+                        cfg.render_scale = kScales[si];
+                        arm64::gl_set_render_scale(float(cfg.render_scale) / 100.0f);
+                    }
+                }
             } else if (menu_page == MenuPage::Audio) {
                 char vbuf[32];
                 std::snprintf(vbuf, sizeof vbuf, "%d%%", cfg.volume);

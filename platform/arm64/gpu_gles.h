@@ -50,10 +50,18 @@ int gl_display_width();
 int gl_display_height();
 void gl_update_drawable_size();
 void gl_set_vsync(bool enabled);
-void gl_begin_frame();
+void gl_begin_frame(bool scene = true);
+void gl_resolve_scene();
 void gl_end_frame();
 void gl_fini();
 void gl_fill_rect(float x, float y, float w, float h, uint32_t rgba);
+float gl_render_scale();
+void gl_set_render_scale(float scale);
+// The driver's glFinish, for benchmarks that must see the work land. Null if unavailable.
+void (*gl_finish_ptr())(void);
+// Split of the last frame's GL time: resident texture updates vs draw submission.
+double gl_upload_ms();
+double gl_submit_ms();
 
 struct GlUiVertex { float x, y, u, v; uint32_t rgba; };
 uint32_t gl_create_ui_texture(int w, int h, const void *rgba);
@@ -81,6 +89,9 @@ public:
     size_t cached_tex_bytes() const { return cached_bytes_; }
     size_t cached_tex_count() const { return sources_.size(); }
     uint32_t last_tex_clears() const { return last_tex_clears_; }
+    // Per-polygon scissor (see poly_scissor_): kept for A/B runs and the autobench.
+    void set_poly_scissor(bool on) { poly_scissor_ = on; }
+    bool poly_scissor() const { return poly_scissor_; }
     uint32_t last_pal_clears() const { return last_pal_clears_; }
 
 private:
@@ -172,6 +183,10 @@ private:
     bool have_gamma_ = false;
 
     std::vector<uint32_t> swizzle_scratch_;
+    // Per-polygon bounding scissor. On by default (what the renderer was tuned for on
+    // Mali-G31); turned off for tile-based GPUs that pay for each scissor change, where
+    // one scissor for the whole 3D pass also lets batching merge far more polygons.
+    bool poly_scissor_ = true;
     size_t last_poly_count_ = 0;
     size_t last_batch_count_ = 0;
     uint32_t last_tex_clears_ = 0;

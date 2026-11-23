@@ -5,7 +5,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <string>
 
 #if defined(__aarch64__)
@@ -142,6 +144,15 @@ struct State {
     std::string renderer_str;
     int display_w = 720, display_h = 480;
 
+    // Render-scale target: the whole scene is drawn into this off-screen buffer at
+    // display_w/h * render_scale and then blitted once to the window. GPUs with weak
+    // fill rate (PowerVR GE8300 on the TrimUI Smart Pro) gain a lot from it.
+    GLuint scene_fbo = 0, scene_color = 0, scene_depth = 0;
+    int scene_w = 0, scene_h = 0;
+    float render_scale = 1.0f;
+    bool scene_scaled = false;
+    int target_w = 720, target_h = 480; // size of the framebuffer being drawn into now
+
     GLuint program[int(Prog::Count)] = {};
     GLint u_inv_screen[int(Prog::Count)] = {};
     static constexpr size_t kVboRing = 3;
@@ -162,8 +173,20 @@ struct State {
     BatchHashSlot batch_hash[kBatchHashSize] = {};
     uint32_t batch_gen = 1;
 
+    // Where a frame's GL time went, for the [perf] line: resident texture updates (2D layers,
+    // the backdrop) against the draw submission itself. On a tile-based driver these behave
+    // very differently -- a partial glTexSubImage2D forces a re-tile, a draw call pays state
+    // validation -- so the split is what says which one to attack.
+    double t_upload_ms = 0.0, t_submit_ms = 0.0;
+
     char error[512] = {};
 } g;
+
+inline double now_ms() {
+    struct timespec ts {};
+    ::clock_gettime(CLOCK_MONOTONIC, &ts);
+    return double(ts.tv_sec) * 1000.0 + double(ts.tv_nsec) / 1.0e6;
+}
 
 void set_error(const char *what, const char *detail = nullptr) {
     std::snprintf(g.error, sizeof g.error, "%s%s%s", what, detail && *detail ? ": " : "", detail ? detail : "");
@@ -293,6 +316,11 @@ size_t write_fan_quads(Vertex *dst, const Vertex *v, int n) {
 
 void execute() {
     if (g.cmds.empty() || !g.verts.size) return;
+    const double t_exec0 = now_ms();
+    struct ExecTimer {
+        double t0;
+        ~ExecTimer() { g.t_submit_ms += now_ms() - t0; }
+    } exec_timer{t_exec0};
     auto &gl = g.gl;
     const GLuint cur_vbo = g.vbo[g.vbo_idx];
     g.vbo_idx = (g.vbo_idx + 1) % State::kVboRing;
@@ -309,8 +337,8 @@ void execute() {
     gl.glBindTexture(GL_TEXTURE_2D, g.palette_texture);
     gl.glActiveTexture(GL_TEXTURE0);
 
-    const float inv_w = 1.0f / float(std::max(g.display_w, 1));
-    const float inv_h = 1.0f / float(std::max(g.display_h, 1));
+    const float inv_w = 1.0f / float(std::max(g.target_w, 1));
+    const float inv_h = 1.0f / float(std::max(g.target_h, 1));
 
     GLuint program = 0, texture = 0;
     int blend = -1, depth_test = -1, clip = -2;
@@ -343,7 +371,7 @@ void execute() {
             } else {
                 const std::array<int, 4> &r = g.clips[size_t(c.clip)];
                 gl.glEnable(GL_SCISSOR_TEST);
-                gl.glScissor(r[0], g.display_h - r[3], r[2] - r[0], r[3] - r[1]);
+                gl.glScissor(r[0], g.target_h - r[3], r[2] - r[0], r[3] - r[1]);
             }
             clip = c.clip;
         }
@@ -415,8 +443,8 @@ GLuint build_program(const ProgramDef &def, GLint &u_inv_out) {
 }
 
 void compute_viewport(int w2d, AspectMode aspect, float &sx, float &sy, float &ox, float &oy) {
-    const float dw = float(std::max(g.display_w, 1));
-    const float dh = float(std::max(g.display_h, 1));
+    const float dw = float(std::max(g.target_w, 1));
+    const float dh = float(std::max(g.target_h, 1));
     const float sw = float(std::max(w2d, 1));
     const float sh = 384.0f;
     if (aspect == AspectMode::StretchFull) {
@@ -465,6 +493,63 @@ inline uint64_t hash_tex_rect(uint32_t base_x, uint32_t base_y, uint32_t w, uint
 }
 
 } // namespace
+
+// Off-screen scene target at display size * render_scale. Created lazily, recreated
+// when the drawable or the scale changes. Returns false if the driver cannot give a
+// complete framebuffer, in which case the scene is drawn straight to the window.
+bool ensure_scene_target() {
+    const int rw = std::max(1, int(std::lround(float(g.display_w) * g.render_scale)));
+    const int rh = std::max(1, int(std::lround(float(g.display_h) * g.render_scale)));
+    if (g.scene_fbo && g.scene_w == rw && g.scene_h == rh) return true;
+    auto &gl = g.gl;
+    if (!gl.glGenFramebuffers || !gl.glGenRenderbuffers || !gl.glCheckFramebufferStatus) return false;
+    if (g.scene_fbo) {
+        GLuint f = g.scene_fbo, c = g.scene_color, d = g.scene_depth;
+        gl.glDeleteFramebuffers(1, &f);
+        gl.glDeleteTextures(1, &c);
+        gl.glDeleteRenderbuffers(1, &d);
+        g.scene_fbo = g.scene_color = g.scene_depth = 0;
+        g.scene_w = g.scene_h = 0;
+    }
+    GLuint fbo = 0, color = 0, depth = 0;
+    gl.glGenFramebuffers(1, &fbo);
+    gl.glGenTextures(1, &color);
+    gl.glGenRenderbuffers(1, &depth);
+    if (!fbo || !color || !depth) {
+        if (fbo) gl.glDeleteFramebuffers(1, &fbo);
+        if (color) gl.glDeleteTextures(1, &color);
+        if (depth) gl.glDeleteRenderbuffers(1, &depth);
+        return false;
+    }
+    gl.glActiveTexture(GL_TEXTURE0);
+    gl.glBindTexture(GL_TEXTURE_2D, color);
+    gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    gl.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    gl.glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, rw, rh, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    gl.glBindRenderbuffer(GL_RENDERBUFFER, depth);
+    gl.glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT16, rw, rh);
+    gl.glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    gl.glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, color, 0);
+    gl.glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, depth);
+    const bool complete = gl.glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+    gl.glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    gl.glBindRenderbuffer(GL_RENDERBUFFER, 0);
+    gl.glBindTexture(GL_TEXTURE_2D, 0);
+    if (!complete) {
+        gl.glDeleteFramebuffers(1, &fbo);
+        gl.glDeleteTextures(1, &color);
+        gl.glDeleteRenderbuffers(1, &depth);
+        return false;
+    }
+    g.scene_fbo = fbo;
+    g.scene_color = color;
+    g.scene_depth = depth;
+    g.scene_w = rw;
+    g.scene_h = rh;
+    return true;
+}
 
 bool gl_init(const GlConfig &cfg) {
     gl_fini();
@@ -515,6 +600,11 @@ bool gl_init(const GlConfig &cfg) {
     g.renderer_str = std::string(g.is_gles ? "GLES2: " : "GL2: ") + (ren ? ren : "unknown") +
                      " (" + (ver ? ver : "?") + ")";
     std::fprintf(stderr, "[ProjectDural] Graphics: %s\n", g.renderer_str.c_str());
+    if (const char *rs = std::getenv("DURAL_RENDER_SCALE")) {
+        const float v = float(std::atof(rs));
+        if (v >= 0.4f && v <= 1.0f) g.render_scale = v;
+    }
+    std::fprintf(stderr, "[ProjectDural] Render scale: %d%%\n", int(std::lround(g.render_scale * 100.0f)));
 
     SDL_ShowCursor(SDL_DISABLE);
     gl_set_vsync(cfg.vsync);
@@ -583,6 +673,15 @@ bool gl_is_gles() { return g.is_gles; }
 SDL_Window *gl_window() { return g.window; }
 int gl_display_width() { return g.display_w; }
 int gl_display_height() { return g.display_h; }
+float gl_render_scale() { return g.render_scale; }
+void (*gl_finish_ptr())(void) { return g.gl.glFinish; }
+double gl_upload_ms() { return g.t_upload_ms; }
+double gl_submit_ms() { return g.t_submit_ms; }
+
+void gl_set_render_scale(float scale) {
+    g.render_scale = std::clamp(scale, 0.25f, 1.0f);
+    g.scene_w = g.scene_h = 0; // force the target to be rebuilt at the new size
+}
 
 void gl_update_drawable_size() {
     if (!g.window) return;
@@ -598,19 +697,57 @@ void gl_set_vsync(bool enabled) {
         SDL_GL_SetSwapInterval(0);
 }
 
-void gl_begin_frame() {
+void gl_begin_frame(bool scene) {
+    g.t_upload_ms = 0.0;
+    g.t_submit_ms = 0.0;
     g.verts.size = 0;
     g.cmds.clear();
     g.clips.clear();
     g.clip = -1;
     auto &gl = g.gl;
-    gl.glViewport(0, 0, g.display_w, g.display_h);
+    g.scene_scaled = scene && g.render_scale < 0.999f && ensure_scene_target();
+    if (g.scene_scaled) {
+        gl.glBindFramebuffer(GL_FRAMEBUFFER, g.scene_fbo);
+        g.target_w = g.scene_w;
+        g.target_h = g.scene_h;
+    } else {
+        gl.glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        g.target_w = g.display_w;
+        g.target_h = g.display_h;
+    }
+    gl.glViewport(0, 0, g.target_w, g.target_h);
     gl.glDisable(GL_SCISSOR_TEST);
     gl.glDepthMask(GL_TRUE);
     gl.glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 }
 
+// Draws everything queued so far into the off-screen target and blits it, scaled, to
+// the window. No-op when the scene is rendered at native resolution.
+void gl_resolve_scene() {
+    if (!g.scene_scaled) return;
+    auto &gl = g.gl;
+    execute();
+    g.cmds.clear();
+    g.verts.size = 0;
+    g.clips.clear();
+    g.clip = -1;
+    gl.glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    g.target_w = g.display_w;
+    g.target_h = g.display_h;
+    gl.glViewport(0, 0, g.target_w, g.target_h);
+    gl.glDisable(GL_SCISSOR_TEST);
+    gl.glDisable(GL_DEPTH_TEST);
+    gl.glDisable(GL_BLEND);
+    push_quad(Prog::Ui, g.scene_color, 0.0f, 0.0f, float(g.display_w), float(g.display_h),
+              0.0f, 0.0f, 1.0f, 1.0f, 0xffffffffu, Depth::Off, false);
+    execute();
+    g.cmds.clear();
+    g.verts.size = 0;
+    g.scene_scaled = false;
+}
+
 void gl_end_frame() {
+    if (g.scene_scaled) gl_resolve_scene();
     execute();
     if (g.window) SDL_GL_SwapWindow(g.window);
 }
@@ -619,6 +756,15 @@ void gl_fini() {
     if (g.ctx) {
         auto &gl = g.gl;
         if (gl.glFinish) gl.glFinish();
+        if (g.scene_fbo) {
+            GLuint f = g.scene_fbo, c = g.scene_color, d = g.scene_depth;
+            if (gl.glBindFramebuffer) gl.glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            if (gl.glDeleteFramebuffers) gl.glDeleteFramebuffers(1, &f);
+            if (gl.glDeleteTextures) gl.glDeleteTextures(1, &c);
+            if (gl.glDeleteRenderbuffers) gl.glDeleteRenderbuffers(1, &d);
+            g.scene_fbo = g.scene_color = g.scene_depth = 0;
+            g.scene_w = g.scene_h = 0;
+        }
         for (int i = 0; i < int(Prog::Count); ++i) {
             bool shared = false;
             for (int j = 0; j < i; ++j) shared = shared || g.program[j] == g.program[i];
@@ -695,6 +841,15 @@ void gl_ui_triangles(uint32_t texture, const GlUiVertex *vertices, size_t count,
 // ---- GpuGlesRenderer ---------------------------------------------------------
 
 GpuGlesRenderer::GpuGlesRenderer() {
+    // GPU quirk selection. PowerVR (TrimUI Smart Pro's GE8300, among others) is tile-based
+    // and drains its tile buffer on every scissor change, so a per-polygon bounding scissor
+    // (what the Mali-G31 tuning wanted) costs more there than it saves; DURAL_POLY_SCISSOR
+    // overrides either way for A/B runs.
+    const std::string &rs = g.renderer_str;
+    poly_scissor_ = rs.find("PowerVR") == std::string::npos &&
+                    rs.find("VideoCore") == std::string::npos;
+    if (const char *v = std::getenv("DURAL_POLY_SCISSOR")) poly_scissor_ = std::atoi(v) != 0;
+    std::fprintf(stderr, "[ProjectDural] Per-poly scissor: %s\n", poly_scissor_ ? "on" : "off (tile-based GPU)");
     palette_shadow_.assign(size_t(kPaletteWidth) * kPaletteRows, 0u);
     auto &gl = g.gl;
     GLuint ptex = 0;
@@ -1205,6 +1360,16 @@ void GpuGlesRenderer::emit_3d_polys(const gpu3d_poly *polys, size_t count, const
         g.batch_gen = 1;
     }
 
+    // One scissor for the whole 3D pass (the 4:3 picture's box on screen) unless the
+    // per-polygon bounding scissor is on. PowerVR is tile-based: every glScissor change
+    // drains the tile buffer, so 150 bboxes cost far more than they save there, while
+    // also blocking batching (a batch is keyed by its clip). Mali, immediate-mode-like in
+    // this respect, paid for it and kept it (poly_scissor_).
+    const int band_clip = add_clip({std::clamp(int(std::floor(ox)), 0, g.target_w),
+                                    std::clamp(int(std::floor(oy)), 0, g.target_h),
+                                    std::clamp(int(std::ceil(ox + float(w2d) * sx)), 0, g.target_w),
+                                    std::clamp(int(std::ceil(oy + 384.0f * sy)), 0, g.target_h)});
+
     const float depth_step = 0.9998f / float(count + 2);
     for (size_t i = 0; i < count; ++i) {
         const gpu3d_poly &p = polys[i];
@@ -1216,12 +1381,12 @@ void GpuGlesRenderer::emit_3d_polys(const gpu3d_poly *polys, size_t count, const
         const int vy1 = std::min(383, int(p.vp[3]));
         if (vx1 < vx0 || vy1 < vy0) continue;
 
-        const int sx0 = std::clamp(int(std::floor(ox + float(vx0) * sx)), 0, g.display_w);
-        const int sy0 = std::clamp(int(std::floor(oy + float(vy0) * sy)), 0, g.display_h);
-        const int sx1 = std::clamp(int(std::ceil(ox + float(vx1 + 1) * sx)), 0, g.display_w);
-        const int sy1 = std::clamp(int(std::ceil(oy + float(vy1 + 1) * sy)), 0, g.display_h);
+        const int sx0 = std::clamp(int(std::floor(ox + float(vx0) * sx)), 0, g.target_w);
+        const int sy0 = std::clamp(int(std::floor(oy + float(vy0) * sy)), 0, g.target_h);
+        const int sx1 = std::clamp(int(std::ceil(ox + float(vx1 + 1) * sx)), 0, g.target_w);
+        const int sy1 = std::clamp(int(std::ceil(oy + float(vy1 + 1) * sy)), 0, g.target_h);
         if (sx1 <= sx0 || sy1 <= sy0) continue;
-        const int clip = add_clip({sx0, sy0, sx1, sy1});
+        const int clip = poly_scissor_ ? add_clip({sx0, sy0, sx1, sy1}) : band_clip;
 
         const float depth = 0.9999f - float(i + 1) * depth_step;
         if (!(p.renderer & 2)) {
@@ -1310,6 +1475,7 @@ void GpuGlesRenderer::draw_frame(const model2a::picture_parts &parts, int w2d, A
 
     const int pad = parts.bd_unpadded ? 0 : model2a::picture_parts::PAD;
     if (parts.version != last_2d_version_) {
+        const double t_up0 = now_ms();
         last_2d_version_ = parts.version;
         if (parts.backdrop) {
             update_texture_2d_rgb565(layer_bd_, w + 2 * pad, 384 + 2 * pad, parts.filter,
@@ -1329,12 +1495,13 @@ void GpuGlesRenderer::draw_frame(const model2a::picture_parts &parts, int w2d, A
             update_texture_2d_rgba5551(layer_top_, w, 384, false, parts.top, size_t(w),
                                        draw_top_y0_, draw_top_y1_, prev_top_y0_, prev_top_y1_);
         }
+        g.t_upload_ms += now_ms() - t_up0;
     }
 
-    const int vx0 = std::clamp(int(std::floor(ox)), 0, g.display_w);
-    const int vy0 = std::clamp(int(std::floor(oy)), 0, g.display_h);
-    const int vx1 = std::clamp(int(std::ceil(ox + float(w) * sx)), 0, g.display_w);
-    const int vy1 = std::clamp(int(std::ceil(oy + 384.0f * sy)), 0, g.display_h);
+    const int vx0 = std::clamp(int(std::floor(ox)), 0, g.target_w);
+    const int vy0 = std::clamp(int(std::floor(oy)), 0, g.target_h);
+    const int vx1 = std::clamp(int(std::ceil(ox + float(w) * sx)), 0, g.target_w);
+    const int vy1 = std::clamp(int(std::ceil(oy + 384.0f * sy)), 0, g.target_h);
     const int screen_clip = add_clip({vx0, vy0, vx1, vy1});
 
     // 1. Backdrop
