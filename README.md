@@ -37,6 +37,17 @@ Sega Model 2A runs Virtua Fighter 2 at a native arcade frame rate of **57.524 FP
 | **ProjectDural GLES 2.0 (SCSP Reverb DSP OFF)** | ~6.5 – 9.5 ms | ~2.0 – 3.0 ms *(parallel)* | ~3.5 – 6.0 ms | **57.52 FPS locked** *(extra battery headroom)* |
 | **CPU Software Rasterizer (`model2_video` fallback)** | ~35 – 65 ms | ~3.5 – 5.0 ms | — | ~15 – 28 FPS *(diagnostic fallback only)* |
 
+### Tested Devices (Real Hardware)
+Measured on retail handhelds with the PortMaster `aarch64` build. The arcade frame rate is `57.524 FPS` (100% speed); `~40 FPS` is about 70% of that.
+
+| Device | SoC | GPU | GPU module (GLES driver) | OS / CFW | Tested performance |
+|---|---|---|---|---|---|
+| **Anbernic RG34XX** | Allwinner H700 (4× Cortex-A53 @ 1.5 GHz) | ARM Mali-G31 MP2 | `libmali.so` (ARM Bifrost userspace blob) + `mali_kbase` kernel module | **Knulli** | **57.52 FPS — full speed** |
+| **Powkiddy RGB30** | Rockchip RK3566 (4× Cortex-A55 @ 1.8 GHz) | ARM Mali-G52 2EE | `libmali.so` (ARM Bifrost G52 userspace blob) + `mali_kbase` kernel module | **ArkOS** | **57.52 FPS — full speed** |
+| **TrimUI Smart Pro** | Allwinner A133P (4× Cortex-A53 @ 1.8 GHz) | Imagination PowerVR GE8300 | `libGLESv2.so` + `libsrv_um.so` (Imagination PowerVR userspace) + `pvrsrvkm` kernel module | **TrimUI stock OS** | **~40 FPS — ~70% of arcade speed** |
+
+The two Mali (Bifrost) handhelds hold the game at its native `57.52 FPS`; the TrimUI Smart Pro's A133P / PowerVR GE8300 combination is the slowest of the three and settles around `40 FPS`, so its fights run below arcade pacing rather than dropping frames or falling back to the CPU rasterizer.
+
 ### Compatible Handhelds
 Compiled for **`aarch64-linux-gnu` / `glibc <= 2.28`** (statically linking `libc++` and `zlib 1.3.1` via Zig, dynamically loading the firmware's hardware-accelerated `libSDL2-2.0.so.0` and OpenGL ES 2.0):
 - **Anbernic XX (Allwinner H700):** RG34XX, RG35XX Plus / H / SP / 2024, RG40XX H / V, RG CubeXX, RG28XX (muOS, Knulli, ROCKNIX, Stock OS)
