@@ -44,11 +44,22 @@ Measured on retail handhelds with the PortMaster `aarch64` build. The arcade fra
 |---|---|---|---|---|---|
 | **Anbernic RG34XX** | Allwinner H700 (4× Cortex-A53 @ 1.5 GHz) | ARM Mali-G31 MP2 | `libmali.so` (ARM Bifrost userspace blob) + `mali_kbase` kernel module | **Knulli** | **57.52 FPS — full speed** |
 | **Powkiddy RGB30** | Rockchip RK3566 (4× Cortex-A55 @ 1.8 GHz) | ARM Mali-G52 2EE | `libmali.so` (ARM Bifrost G52 userspace blob) + `mali_kbase` kernel module | **ArkOS** | **57.52 FPS — full speed** |
-| **TrimUI Smart Pro** | Allwinner A133P (4× Cortex-A53 @ 1.8 GHz) | Imagination PowerVR GE8300 | `libGLESv2.so` + `libsrv_um.so` (Imagination PowerVR userspace) + `pvrsrvkm` kernel module | **Spruce** | **50–56 FPS** with all 4 cores online (see note) |
+| **TrimUI Smart Pro** | Allwinner A133P (4× Cortex-A53 @ 1.8 GHz) | Imagination PowerVR GE8300 | `libGLESv2.so` + `libsrv_um.so` (Imagination PowerVR userspace) + `pvrsrvkm` kernel module | **Spruce** | **~50 FPS typical (48–56)**, up to **57.5** at 2.0 GHz (see note) |
 
-The two Mali (Bifrost) handhelds hold the game at its native `57.52 FPS`. The TrimUI Smart Pro's A133P / PowerVR GE8300 is the slowest of the three, settling at `50–56 FPS`, so its fights run a little below arcade pacing.
+The two Mali (Bifrost) handhelds hold the game at its native `57.52 FPS`. The TrimUI Smart Pro's A133P / PowerVR GE8300 is the slowest of the three and sits just under arcade pacing. Measured over real play sessions (`[perf]` samples every 5 s, fights only):
 
-> **TrimUI Smart Pro on Spruce: cores 1–2 are hotplugged off.** Spruce boots with `online: 0,3`, and the port's threads are pinned to cores 0–3 by role (main / emulation / sound / audio). When a pinned core does not exist the pin fails silently and every thread collapses onto core 0 — the whole 4-thread pipeline then shares one CPU and the game measured **26–28 FPS**. The launcher now brings cores 1–2 up for the session (and puts them back afterwards), and the binary resolves each role against the cores actually online, so the same hardware reaches **50–56 FPS**. If you see roughly half speed, check `cat /sys/devices/system/cpu/online` — it should be `0-3` while the port runs.
+| TrimUI Smart Pro, 4 cores online | Median | 90th pct | Peak |
+|---|---|---|---|
+| Spruce's own CPU policy (`conservative`, ~1.8 GHz) | **49.9 FPS** | 53.6 | 55.7 |
+| CPU governor pinned to `performance` (2.0 GHz) | **53.8 FPS** | 57.4 | **57.4** |
+
+At 1.8 GHz it holds roughly 87% of the arcade frame rate; at 2.0 GHz it reaches full speed for most of a fight. The cost split at 4 cores is ~13 ms emulation and ~13.5 ms of main-thread work (2D snapshot, GL submit, swap), overlapped, so neither side is starved.
+
+> **TrimUI Smart Pro on Spruce: why it adds up to `cores 1–2` being off.** Spruce has a CPU Mode setting (`Smart` / `Powersave`) and its model config makes the difference explicit: `CPU_SMART_CORES_ONLINE=0123` against `DEVICE_MIN_CORES_ONLINE=03`, with `Powersave` also capping the clock at 1488 MHz. In Powersave the firmware deliberately hot-unplugs cores 1–2 to save battery — that is a power policy, not a fault.
+>
+> It became our bug because the port pins its threads to cores 0–3 by role (main / emulation / sound / audio) and said nothing when a pin failed: `sysconf` reported 2 CPUs, cores 2–3 looked merely out of range, `pthread_setaffinity_np` returned `EINVAL` for cores that were offline, and the error was dropped. All seven threads kept the affinity they inherited, so the whole 4-thread pipeline ran on core 0 and measured **34.9 FPS median (24–43)**. The binary now resolves each role against the cores actually online and reports it; the launcher starts cores 1–2 for the session and puts back offline the ones it started, then restores the CPU governor and file modes. The same hardware reaches the numbers above.
+>
+> If fights run at roughly half speed, check `cat /sys/devices/system/cpu/online` — it should be `0-3` while the port runs. Switching Spruce's CPU Mode to `Smart` also keeps all four cores up outside the port.
 
 ### Compatible Handhelds
 Compiled for **`aarch64-linux-gnu` / `glibc <= 2.28`** (statically linking `libc++` and `zlib 1.3.1` via Zig, dynamically loading the firmware's hardware-accelerated `libSDL2-2.0.so.0` and OpenGL ES 2.0):
