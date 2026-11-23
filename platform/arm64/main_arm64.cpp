@@ -26,6 +26,7 @@
 
 #include <SDL.h>
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cmath>
 #include <cstdio>
@@ -62,6 +63,12 @@ int cpu_mhz_now() {
     std::fclose(f);
     return khz > 0 ? int(khz / 1000) : -1;
 }
+
+// Instrumentation switch. The timeline marks below are taken inside wait_render_done(),
+// which model2a calls on every video-RAM change -- many times a frame, not once -- so two
+// clock_gettime() calls there cost measurable time (about 1.3% of the frame on the RG34XX).
+// They are therefore taken only when DURAL_TIMELINE asked for them.
+std::atomic<bool> g_timeline_marks{false};
 
 class EmuWorker {
 public:
@@ -137,10 +144,10 @@ public:
 
 private:
     void wait_render_done() {
-        tl_wait_begin_.store(ticks_us(), std::memory_order_relaxed);
+        if (g_timeline_marks.load(std::memory_order_relaxed)) tl_wait_begin_.store(ticks_us(), std::memory_order_relaxed);
         std::unique_lock<std::mutex> lk(mu_);
         render_cv_.wait(lk, [&] { return !render_busy_ || stop_; });
-        tl_wait_end_.store(ticks_us(), std::memory_order_relaxed);
+        if (g_timeline_marks.load(std::memory_order_relaxed)) tl_wait_end_.store(ticks_us(), std::memory_order_relaxed);
     }
 
     void loop() {
@@ -153,12 +160,14 @@ private:
                 if (stop_) return;
             }
             const uint64_t t0 = ticks_us();
-            tl_wait_begin_.store(0, std::memory_order_relaxed);
-            tl_wait_end_.store(0, std::memory_order_relaxed);
-            tl_start_.store(t0, std::memory_order_relaxed);
+            if (g_timeline_marks.load(std::memory_order_relaxed)) {
+                tl_wait_begin_.store(0, std::memory_order_relaxed);
+                tl_wait_end_.store(0, std::memory_order_relaxed);
+                tl_start_.store(t0, std::memory_order_relaxed);
+            }
             game_->run_frame();
             const uint64_t t1 = ticks_us();
-            tl_end_.store(t1, std::memory_order_relaxed);
+            if (g_timeline_marks.load(std::memory_order_relaxed)) tl_end_.store(t1, std::memory_order_relaxed);
             const double ms = double(t1 - t0) / 1000.0;
             last_emu_ms_.store(ms, std::memory_order_relaxed);
             {
@@ -916,6 +925,7 @@ int main(int argc, char **argv) {
     // prints them. Only frames heavy enough to matter are printed (a fight, not a logo),
     // so the capture does not depend on timing a menu.
     const bool timeline_on = std::getenv("DURAL_TIMELINE") != nullptr;
+    g_timeline_marks.store(timeline_on, std::memory_order_relaxed);
     const int kTimelineFrames = 60;
     const size_t kTimelineMinPolys = 700;
     int tl_printed = 0;
