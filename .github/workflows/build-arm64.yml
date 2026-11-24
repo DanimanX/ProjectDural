@@ -34,23 +34,27 @@ jobs:
         run: |
           sudo apt-get -o Acquire::Retries=3 update -q
           sudo apt-get -o Acquire::Retries=3 install -qy --no-install-recommends \
-            build-essential python3 curl git tar xz-utils zip file binutils
+            build-essential cmake ninja-build python3 curl git tar xz-utils zip file binutils \
+            libwayland-dev libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev \
+            libxi-dev libxss-dev libxkbcommon-dev libdrm-dev libgbm-dev \
+            libasound2-dev libpulse-dev libpipewire-0.3-dev
 
-      - name: Cache cross-compile dependencies (Zig, SDL2 headers, zlib, Dear ImGui)
+      - name: Cache cross-compile dependencies (Zig, SDL2/SDL3, zlib, Dear ImGui)
         uses: actions/cache@v4
         with:
           path: |
             deps
             extern
             !deps/zig-cache
-          key: projectdural-deps-${{ hashFiles('tools/build-arm64.sh') }}
+          key: projectdural-deps-${{ hashFiles('tools/build-arm64.sh', 'tools/build-arm64-vulkan.sh') }}
 
-      - name: Cross-compile AArch64 runtime and assemble PortMaster package
+      - name: Cross-compile AArch64 runtime and assemble PortMaster + Vulkan packages
         env:
           TARGET_CPU: ${{ github.event.inputs.target_cpu || 'cortex_a53' }}
         run: |
-          chmod +x tools/build-arm64.sh tools/build-host-test.sh portmaster/*.sh
+          chmod +x tools/build-arm64.sh tools/build-arm64-vulkan.sh tools/build-host-test.sh portmaster/*.sh
           tools/build-arm64.sh
+          TARGET_CPU=generic tools/build-arm64-vulkan.sh
           (cd dist && sha256sum ProjectDural-PortMaster-aarch64.zip > ProjectDural-PortMaster-aarch64.zip.sha256)
           ls -lh dist/
 
@@ -58,13 +62,15 @@ jobs:
         run: |
           tools/build-host-test.sh 60
 
-      - name: Upload PortMaster artifact
+      - name: Upload PortMaster and Vulkan artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ProjectDural-PortMaster-aarch64
           path: |
             dist/ProjectDural-PortMaster-aarch64.zip
             dist/ProjectDural-PortMaster-aarch64.zip.sha256
+            dist/ProjectDural-Vulkan-aarch64.zip
+            dist/ProjectDural-Vulkan-aarch64.zip.sha256
 
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
@@ -72,7 +78,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
-          FILES="dist/ProjectDural-PortMaster-aarch64.zip dist/ProjectDural-PortMaster-aarch64.zip.sha256"
+          FILES="dist/ProjectDural-PortMaster-aarch64.zip dist/ProjectDural-PortMaster-aarch64.zip.sha256 dist/ProjectDural-Vulkan-aarch64.zip dist/ProjectDural-Vulkan-aarch64.zip.sha256"
           # Per-release highlights live in docs/release-notes/<tag>.md and are prepended to the
           # notes every release shares. A tag without its own file still gets the common part,
           # so publishing never depends on remembering to write one.

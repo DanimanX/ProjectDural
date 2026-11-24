@@ -45,6 +45,7 @@ Measured on retail handhelds with the PortMaster `aarch64` build. The arcade fra
 | **Anbernic RG34XX** | Allwinner H700 (4× Cortex-A53 @ 1.5 GHz) | ARM Mali-G31 MP2 | `libmali.so` (ARM Bifrost userspace blob) + `mali_kbase` kernel module | **Knulli** | **57.52 FPS — full speed** |
 | **Powkiddy RGB30** | Rockchip RK3566 (4× Cortex-A55 @ 1.8 GHz) | ARM Mali-G52 2EE | `libmali.so` (ARM Bifrost G52 userspace blob) + `mali_kbase` kernel module | **ArkOS** | **57.52 FPS — full speed** |
 | **TrimUI Smart Pro** | Allwinner A133P (4× Cortex-A53 @ 1.8 GHz) | Imagination PowerVR GE8300 | `libGLESv2.so` + `libsrv_um.so` (Imagination PowerVR userspace) + `pvrsrvkm` kernel module | **Spruce** | **~50 FPS typical (48–56)**, up to **57.5** at 2.0 GHz (see note) |
+| **OnePlus Pad Pro** | Qualcomm SM8650 (8-core ARMv9) | Qualcomm Adreno 750 | **Mesa Turnip 26.3.1** (Vulkan 1.4.363, `SDL_GPU` SPIR-V compute) | **Arch Linux ARM** (Wayland + PipeWire) | **120 FPS** (display-capped; `--bench-gles`: **1788 FPS** @ 1500 polys, `0.56 ms/frame`) |
 
 The two Mali (Bifrost) handhelds hold the game at its native `57.52 FPS`. The TrimUI Smart Pro's A133P / PowerVR GE8300 is the slowest of the three and sits just under arcade pacing. Measured over real play sessions (`[perf]` samples every 5 s, fights only):
 
@@ -100,6 +101,15 @@ This creates **`dist/ProjectDural-PortMaster-aarch64.zip`** (zero ROMs, zero gam
 - `projectdural/vf2.aarch64` (ARM64 Cortex-A53, SLJIT ARM64, OpenGL ES 2.0, NEON, max `GLIBC_2.28`, static `zlib` & `libc++`)
 - `projectdural/assets/backgrounds/select.png` (3:2 widescreen character select sides)
 - `projectdural/gamecontrollerdb.txt`, `port.json`, `gameinfo.xml`, and licences
+
+### 1b. Build the Standalone AArch64 Vulkan Runtime (Wayland / X11 / KMSDRM)
+For ARM64 Linux devices with Vulkan drivers (e.g. Mesa Turnip / Adreno, PanVK, Pi 5 V3DV), a separate ROM-free runtime using static **SDL3 (`SDL_GPU` Vulkan + SPIR-V compute shaders)** and Dear ImGui `SDL_GPU3` can be built via:
+
+```bash
+tools/build-arm64-vulkan.sh
+```
+
+This produces **`dist/ProjectDural-Vulkan-aarch64.zip`** (`Virtua Fighter 2 Vulkan.sh` + `projectdural-vulkan/vf2-vulkan.aarch64`, max `GLIBC_2.27`, zero `libstdc++.so` / `libSDL3.so` / `libz.so` dependency; `libvulkan.so.1`, Wayland/X11/KMSDRM, and PipeWire/PulseAudio/ALSA are loaded dynamically via `dlopen`).
 
 ### 2. Extract to Your Handheld & Copy Your Legal `vf2.zip`
 1. Extract `ProjectDural-PortMaster-aarch64.zip` into your PortMaster `ports/` folder (e.g., `/mnt/sdcard/ports/` on muOS, `/userdata/roms/ports/` on Knulli, `/roms/ports/` on ArkOS).

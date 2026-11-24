@@ -62,6 +62,7 @@ void (*gl_finish_ptr())(void);
 // Split of the last frame's GL time: resident texture updates vs draw submission.
 double gl_upload_ms();
 double gl_submit_ms();
+inline void gl_process_event(const SDL_Event &) {}
 
 struct GlUiVertex { float x, y, u, v; uint32_t rgba; };
 uint32_t gl_create_ui_texture(int w, int h, const void *rgba);

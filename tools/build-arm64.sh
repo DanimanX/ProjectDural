@@ -11,6 +11,9 @@
 #   TARGET_CPU=cortex_a55 tools/build-arm64.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."
+if [ -n "${TMPDIR:-}" ] && [ ! -d "$TMPDIR" ]; then
+    export TMPDIR="/tmp"
+fi
 
 DEPS="$PWD/deps"
 EXTERN="$PWD/extern"
@@ -23,7 +26,21 @@ TARGET_TRIPLE="aarch64-linux-gnu.2.28"
 JOBS="${JOBS:-$(nproc)}"
 
 ZIG_VER="0.17.0"
-ZIG_SHA="1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026"
+HOST_ARCH="$(uname -m)"
+case "$HOST_ARCH" in
+    x86_64|amd64)
+        ZIG_ARCH="x86_64"
+        ZIG_SHA="1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026"
+        ;;
+    aarch64|arm64)
+        ZIG_ARCH="aarch64"
+        ZIG_SHA="9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8"
+        ;;
+    *)
+        echo "ERROR: unsupported host architecture for Zig: $HOST_ARCH" >&2
+        exit 1
+        ;;
+esac
 SDL_VER="2.32.10"
 SDL_SHA="5f5993c530f084535c65a6879e9b26ad441169b3e25d789d83287040a9ca5165"
 ZLIB_VER="1.3.1"
@@ -60,12 +77,12 @@ fetch_git() {
 
 # 1. Host Zig compiler (hermetic aarch64-linux-gnu.2.28 C/C++20 cross-compiler)
 if [ ! -x "$DEPS/zig-linux/zig" ]; then
-    echo "[1/6] Fetching Zig $ZIG_VER..."
-    fetch_file "https://ziglang.org/download/$ZIG_VER/zig-x86_64-linux-$ZIG_VER.tar.xz" \
-        "zig-x86_64-linux-$ZIG_VER.tar.xz" "$ZIG_SHA"
-    tar -C "$DEPS" -xJf "$DEPS/dl/zig-x86_64-linux-$ZIG_VER.tar.xz"
+    echo "[1/6] Fetching Zig $ZIG_VER ($ZIG_ARCH-linux)..."
+    fetch_file "https://ziglang.org/download/$ZIG_VER/zig-$ZIG_ARCH-linux-$ZIG_VER.tar.xz" \
+        "zig-$ZIG_ARCH-linux-$ZIG_VER.tar.xz" "$ZIG_SHA"
+    tar -C "$DEPS" -xJf "$DEPS/dl/zig-$ZIG_ARCH-linux-$ZIG_VER.tar.xz"
     rm -rf "$DEPS/zig-linux"
-    mv "$DEPS/zig-x86_64-linux-$ZIG_VER" "$DEPS/zig-linux"
+    mv "$DEPS/zig-$ZIG_ARCH-linux-$ZIG_VER" "$DEPS/zig-linux"
 fi
 ZIG_BIN="$DEPS/zig-linux/zig"
 export ZIG_GLOBAL_CACHE_DIR="$DEPS/zig-cache"

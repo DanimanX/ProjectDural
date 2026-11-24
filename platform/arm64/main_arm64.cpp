@@ -10,8 +10,15 @@
 
 #include "audio.h"
 #include "controls.h"
+#ifdef VF2_VULKAN
+#include "gpu_vulkan.h"
+#include "imgui_vulkan.h"
+#include <SDL3/SDL.h>
+#else
 #include "gpu_gles.h"
 #include "imgui_gles.h"
+#include <SDL.h>
+#endif
 #include "sound_worker.h"
 #include "thread_affinity.h"
 
@@ -24,7 +31,6 @@
 // For --bench-synthetic ROM-free verification
 #include "../tools/synthetic_rom.h"
 
-#include <SDL.h>
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -722,8 +728,12 @@ int main(int argc, char **argv) {
     if (cli.show_fps) cfg.show_fps = true;
     if (cli.arcade) { cfg.free_play = false; cfg.fast_boot = false; }
 
+#ifdef VF2_VULKAN
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMEPAD | SDL_INIT_JOYSTICK)) {
+#else
     SDL_SetMainReady();
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER | SDL_INIT_JOYSTICK) != 0) {
+#endif
         std::fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         return 1;
     }
@@ -768,10 +778,18 @@ int main(int argc, char **argv) {
         while (!quit) {
             SDL_Event e;
             while (SDL_PollEvent(&e)) {
+                arm64::gl_process_event(e);
+#ifdef VF2_VULKAN
+                if (e.type == SDL_EVENT_QUIT) quit = true;
+                else if (e.type == SDL_EVENT_KEY_DOWN && (e.key.key == SDLK_ESCAPE || e.key.key == SDLK_RETURN)) quit = true;
+                else if (e.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) arm64::gl_update_drawable_size();
+                else pads.handle_event(e);
+#else
                 if (e.type == SDL_QUIT) quit = true;
                 else if (e.type == SDL_KEYDOWN && (e.key.keysym.sym == SDLK_ESCAPE || e.key.keysym.sym == SDLK_RETURN)) quit = true;
                 else if (e.type == SDL_WINDOWEVENT && e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) arm64::gl_update_drawable_size();
                 else pads.handle_event(e);
+#endif
             }
             const uint32_t b0 = pads.poll_player(0, SDL_GetKeyboardState(nullptr));
             if (b0 & (arm64::BtnA | arm64::BtnB | arm64::Start | arm64::Guide)) quit = true;
@@ -938,17 +956,25 @@ int main(int argc, char **argv) {
     while (running) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
+            arm64::gl_process_event(e);
+#ifdef VF2_VULKAN
+            if (e.type == SDL_EVENT_QUIT) running = false;
+            else if (e.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED)
+                arm64::gl_update_drawable_size();
+            else pads.handle_event(e);
+#else
             if (e.type == SDL_QUIT) running = false;
             else if (e.type == SDL_WINDOWEVENT && e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED)
                 arm64::gl_update_drawable_size();
             else pads.handle_event(e);
+#endif
         }
 
         if (autobench_step >= 0 && ticks_us() - autobench_t0 >= uint64_t(autobench_secs) * 1000000ull) {
             autobench_t0 = ticks_us();
             apply_bench_step(autobench_step++);
         }
-        const uint8_t *keys = SDL_GetKeyboardState(nullptr);
+        const auto *keys = SDL_GetKeyboardState(nullptr);
         const uint32_t p0_btns = pads.poll_player(0, keys);
         const uint32_t p1_btns = pads.poll_player(1, keys);
 
