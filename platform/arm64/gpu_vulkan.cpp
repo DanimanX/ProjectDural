@@ -96,11 +96,15 @@ void compute_viewport(AspectMode aspect, int w2d, float &vx, float &vy, float &v
     }
 }
 
+// A rectangle in display pixels (top-left origin, +Y down) to NDC for the quad shader, which lays
+// its corners out as dst + corner * dst_size with texture v growing with +Y. SDL_GPU's NDC has +Y
+// up (SDL_gpu.h, Coordinate System), so the top edge (py) is the quad's *upper* NDC edge: without
+// this, every layer lands upside down (and the game with it).
 void px_to_ndc(float px, float py, float pw, float ph, float &nx, float &ny, float &nw, float &nh) {
     const float dw = float(std::max(1, g.disp_w));
     const float dh = float(std::max(1, g.disp_h));
     nx = (px / dw) * 2.0f - 1.0f;
-    ny = (py / dh) * 2.0f - 1.0f;
+    ny = 1.0f - ((py + ph) / dh) * 2.0f;   // the bottom edge; +nh reaches the top edge (py)
     nw = (pw / dw) * 2.0f;
     nh = (ph / dh) * 2.0f;
 }
@@ -392,8 +396,11 @@ void gl_end_frame() {
             SDL_BindGPUGraphicsPipeline(rp, pipe);
             SDL_GPUTextureSamplerBinding tsb{q.tex, q.linear ? g.samp_linear : g.samp_nearest};
             SDL_BindGPUFragmentSamplers(rp, 0, &tsb, 1);
+            // the quad shader adds corner * size to both the position and the texture coordinate, so
+            // with NDC +Y up (see px_to_ndc) the texture's first row (v = 0, the picture's top) has to
+            // sit on the quad's upper edge: v runs src_v + src_vh at the bottom up to src_v at the top.
             const float v_ubo[8] = {q.dst_x, q.dst_y, q.dst_w, q.dst_h,
-                                    q.src_u, q.src_v, q.src_uw, q.src_vh};
+                                    q.src_u, q.src_v + q.src_vh, q.src_uw, -q.src_vh};
             const float f_ubo[4] = {q.force_opaque ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f};
             SDL_PushGPUVertexUniformData(cb, 0, v_ubo, sizeof(v_ubo));
             SDL_PushGPUFragmentUniformData(cb, 0, f_ubo, sizeof(f_ubo));
